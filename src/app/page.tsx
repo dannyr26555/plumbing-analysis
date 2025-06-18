@@ -6,32 +6,23 @@ import PdfViewer from '@/components/PdfViewer';
 import PlumbingAnalysis from '@/components/PlumbingAnalysis';
 
 export default function Home() {
-  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
-  const [analysis, setAnalysis] = useState<string | null>(null);
-  const [isUploaded, setIsUploaded] = useState(false);
+  const [pdfUrl, setPdfUrl] = useState<string>('');
+  const [analysis, setAnalysis] = useState<string>('');
 
-  const handleUploadComplete = (url: string, analysisContent: string) => {
+  const handleUploadSuccess = (url: string, analysis: string) => {
     setPdfUrl(url);
-    setAnalysis(analysisContent);
-    setIsUploaded(true);
+    setAnalysis(analysis);
   };
 
   return (
-    <main className="min-h-screen bg-gray-900 py-12">
-      <div className="container mx-auto px-4">
-        <h1 className="text-4xl font-bold text-center text-white mb-8">
-          Plumbing Analysis
-        </h1>
-        {!isUploaded ? (
-          <PdfUploader onUploadComplete={handleUploadComplete} />
+    <main className="min-h-screen bg-gray-900 py-8">
+      <div className="max-w-[1920px] mx-auto px-4">
+        {!pdfUrl ? (
+          <PdfUploader onUploadSuccess={handleUploadSuccess} />
         ) : (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-            <div className="order-2 lg:order-1">
-              {analysis && <PlumbingAnalysis analysis={analysis} />}
-            </div>
-            <div className="order-1 lg:order-2">
-              {pdfUrl && <PdfViewer pdfUrl={pdfUrl} />}
-            </div>
+          <div className="flex gap-6">
+            <PlumbingAnalysis analysis={analysis} />
+            <PdfViewer url={pdfUrl} />
           </div>
         )}
       </div>

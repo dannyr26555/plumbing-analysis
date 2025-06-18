@@ -1,17 +1,21 @@
 'use client';
 
+import { useState, useEffect } from 'react';
+import { Document, Page, pdfjs } from 'react-pdf';
+import 'react-pdf/dist/esm/Page/AnnotationLayer.css';
+import 'react-pdf/dist/esm/Page/TextLayer.css';
+
 interface PdfViewerProps {
-  pdfUrl: string;
+  url: string;
 }
 
-export default function PdfViewer({ pdfUrl }: PdfViewerProps) {
+export default function PdfViewer({ url }: PdfViewerProps) {
   return (
-    <div className="w-full max-w-4xl mx-auto p-6 bg-gray-800 rounded-xl shadow-lg border border-gray-700 mb-8">
-      <h2 className="text-2xl font-semibold text-white mb-4">PDF Document</h2>
-      <div className="w-full h-[600px] bg-gray-700 rounded-lg overflow-hidden">
+    <div className="w-[35%] p-6 bg-gray-800 rounded-xl shadow-lg border border-gray-700">
+      <div className="flex flex-col items-center">
         <iframe
-          src={pdfUrl}
-          className="w-full h-full"
+          src={url}
+          className="w-full h-[800px] border-0"
           title="PDF Viewer"
         />
       </div>

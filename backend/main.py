@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 import os
 from dotenv import load_dotenv
 import fitz  # PyMuPDF
@@ -121,6 +121,11 @@ async def analyze_pdf(file: UploadFile):
         safe_filename = sanitize_filename(file.filename)
         logger.info(f"Processing PDF file: {safe_filename}, size: {len(content)} bytes")
         
+        # Save the uploaded file
+        temp_file_path = os.path.join(tempfile.gettempdir(), safe_filename)
+        with open(temp_file_path, "wb") as f:
+            f.write(content)
+        
         # Convert PDF to images
         pdf_converter = PDFConverter()
         try:
@@ -176,15 +181,10 @@ Please analyze this construction plan focusing specifically on plumbing systems.
             # Clean up temporary files
             pdf_converter.cleanup()
 
+            backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
             return {
-                "status": "success",
-                "data": {
-                    "document_info": {
-                        "filename": safe_filename,
-                        "pages": len(pages_info)
-                    },
-                    "analysis": analysis_content
-                }
+                "pdfUrl": f"{backend_url}/api/images/{safe_filename}",
+                "analysis": analysis_content
             }
 
         except Exception as e:
@@ -195,6 +195,18 @@ Please analyze this construction plan focusing specifically on plumbing systems.
     except Exception as e:
         logger.error(f"Error processing PDF: {str(e)}")
         raise HTTPException(status_code=500, detail="Error processing document")
+
+@app.get("/api/images/{filename}")
+async def get_image(filename: str):
+    """Serve PDF files"""
+    try:
+        file_path = os.path.join(tempfile.gettempdir(), filename)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found")
+        return FileResponse(file_path, media_type="application/pdf")
+    except Exception as e:
+        logger.error(f"Error serving file: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error serving file")
 
 if __name__ == "__main__":
     import uvicorn

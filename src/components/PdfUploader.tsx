@@ -3,92 +3,107 @@
 import { useState } from 'react';
 
 interface PdfUploaderProps {
-  onUploadComplete: (url: string, analysis: string) => void;
+  onUploadSuccess: (url: string, analysis: string) => void;
 }
 
-export default function PdfUploader({ onUploadComplete }: PdfUploaderProps) {
+export default function PdfUploader({ onUploadSuccess }: PdfUploaderProps) {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    if (event.target.files && event.target.files[0]) {
-      setSelectedFile(event.target.files[0]);
-      setError(null);
+  const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    if (!file.name.toLowerCase().endsWith('.pdf')) {
+      setError('Please select a PDF file');
+      setSelectedFile(null);
+      return;
     }
+
+    setSelectedFile(file);
+    setError(null);
   };
 
   const handleUpload = async () => {
-    if (!selectedFile) return;
+    if (!selectedFile) {
+      setError('Please select a file first');
+      return;
+    }
 
     setIsUploading(true);
     setError(null);
 
-    try {
-      const formData = new FormData();
-      formData.append('file', selectedFile);
+    const formData = new FormData();
+    formData.append('file', selectedFile);
 
+    try {
       const response = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/api/analyze`, {
         method: 'POST',
         body: formData,
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Failed to upload file');
+        throw new Error('Failed to analyze PDF');
       }
 
       const data = await response.json();
-      
-      // Create a URL for the selected file
-      const fileUrl = URL.createObjectURL(selectedFile);
-      
-      // Pass both the file URL and analysis to the parent component
-      onUploadComplete(fileUrl, data.data.analysis);
-    } catch (error) {
-      console.error('Error uploading file:', error);
-      setError(error instanceof Error ? error.message : 'Failed to upload file');
+      onUploadSuccess(data.pdfUrl, data.analysis);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
       setIsUploading(false);
     }
   };
 
   return (
-    <div className="w-full max-w-md mx-auto p-6 bg-gray-800 rounded-xl shadow-lg border border-gray-700">
-      <div className="mb-4">
-        <label className="block text-gray-200 text-sm font-semibold mb-2" htmlFor="pdf-upload">
-          Select PDF File
-        </label>
-        <div className="relative">
+    <div className="w-full max-w-4xl mx-auto p-6 bg-gray-800 rounded-xl shadow-lg border border-gray-700">
+      <h2 className="text-2xl font-semibold text-white mb-6">Upload PDF</h2>
+      
+      <div className="space-y-4">
+        {/* File Input */}
+        <div>
+          <label htmlFor="pdf-file" className="block text-sm font-medium text-gray-300 mb-2">
+            Select PDF File
+          </label>
           <input
-            id="pdf-upload"
+            id="pdf-file"
             type="file"
             accept=".pdf"
-            onChange={handleFileChange}
-            className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200
-                     file:mr-4 file:py-2 file:px-4
-                     file:rounded-md file:border-0
-                     file:text-sm file:font-semibold
-                     file:bg-blue-500 file:text-white
-                     hover:file:bg-blue-600
-                     focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            onChange={handleFileSelect}
+            disabled={isUploading}
+            className="block w-full text-sm text-gray-300 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-medium file:bg-blue-500 file:text-white hover:file:bg-blue-600 file:cursor-pointer cursor-pointer bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
           />
         </div>
+
+        {/* Selected File Display */}
+        {selectedFile && (
+          <div className="p-3 bg-gray-700 rounded-lg border border-gray-600">
+            <p className="text-sm text-gray-300">
+              <span className="font-medium">Selected file:</span> {selectedFile.name}
+            </p>
+            <p className="text-xs text-gray-400 mt-1">
+              Size: {(selectedFile.size / 1024 / 1024).toFixed(2)} MB
+            </p>
+          </div>
+        )}
+
+        {/* Upload Button */}
+        <button
+          onClick={handleUpload}
+          disabled={!selectedFile || isUploading}
+          className="w-full px-4 py-3 bg-blue-500 text-white font-medium rounded-lg hover:bg-blue-600 focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-gray-800 disabled:bg-gray-600 disabled:cursor-not-allowed disabled:opacity-50 transition-colors duration-200"
+        >
+          {isUploading ? 'Analyzing PDF...' : 'Upload & Analyze'}
+        </button>
+
+        {/* Error Message */}
         {error && (
-          <p className="mt-2 text-red-500 text-sm">{error}</p>
+          <div className="p-3 bg-red-900 border border-red-700 rounded-lg">
+            <p className="text-red-300 text-sm">{error}</p>
+          </div>
         )}
       </div>
-      <button
-        onClick={handleUpload}
-        disabled={!selectedFile || isUploading}
-        className={`w-full py-2 px-4 rounded-lg text-white font-semibold transition-colors duration-200 ${
-          selectedFile && !isUploading
-            ? 'bg-blue-500 hover:bg-blue-600 focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-gray-800'
-            : 'bg-gray-600 cursor-not-allowed'
-        }`}
-      >
-        {isUploading ? 'Uploading...' : 'Upload'}
-      </button>
     </div>
   );
 } 
