@@ -1,0 +1,17 @@
+fastapi==0.109.2
+uvicorn==0.27.1
+python-multipart==0.0.9
+openai>=1.35.0
+autogen-agentchat==0.5.7
+autogen-ext[openai]==0.5.7
+python-dotenv==1.0.1
+pydantic>=2.10.0,<3.0.0
+PyMuPDF>=1.24.0
+fastapi-users[sqlalchemy]
+sqlalchemy
+pymysql
+passlib[bcrypt]
+email-validator
+Pillow
+azure-ai-inference>=1.0.0
+azure-identity>=1.15.0 
