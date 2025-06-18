@@ -16,11 +16,11 @@ export default function Home() {
 
   return (
     <main className="min-h-screen bg-gray-900 py-8">
-      <div className="max-w-[1920px] mx-auto px-4">
+      <div className="max-w-7xl mx-auto px-4">
         {!pdfUrl ? (
           <PdfUploader onUploadSuccess={handleUploadSuccess} />
         ) : (
-          <div className="flex gap-6">
+          <div className="flex gap-6 justify-center">
             <PlumbingAnalysis analysis={analysis} />
             <PdfViewer url={pdfUrl} />
           </div>

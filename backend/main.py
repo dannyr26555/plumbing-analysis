@@ -1,6 +1,6 @@
-from fastapi import FastAPI, UploadFile, HTTPException, Depends, Request
+from fastapi import FastAPI, UploadFile, HTTPException, Depends, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 import os
 from dotenv import load_dotenv
 import fitz  # PyMuPDF
@@ -17,10 +17,17 @@ from autogen_agentchat.messages import MultiModalMessage
 import json
 from pathlib import Path
 from config.agent_config import SYSTEM_MESSAGES, AGENT_CONFIG, RESPONSE_FORMAT
+import asyncio
+import uuid
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Store for progress updates
+progress_store = {}
+# Store for analysis results
+result_store = {}
 
 # Load environment variables from project root
 try:
@@ -110,91 +117,149 @@ def sanitize_filename(filename: str) -> str:
     """Sanitize filename to prevent path traversal and remove sensitive information."""
     return os.path.basename(filename)
 
-@app.post("/api/analyze")
-async def analyze_pdf(file: UploadFile):
+def update_progress(task_id: str, stage: str, current: int, total: int, message: str):
+    """Update progress for a specific task"""
+    progress_store[task_id] = {
+        "stage": stage,
+        "current": current,
+        "total": total,
+        "message": message,
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.post("/api/upload")
+async def upload_pdf(file: UploadFile):
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Invalid file format")
+    task_id = str(uuid.uuid4())
+    safe_filename = sanitize_filename(file.filename)
+    temp_file_path = os.path.join(tempfile.gettempdir(), f"{task_id}_{safe_filename}")
+    content = await file.read()
+    with open(temp_file_path, "wb") as f:
+        f.write(content)
+    update_progress(task_id, "uploading", 100, 100, "File upload complete")
+    return {"taskId": task_id, "filename": safe_filename}
 
+@app.post("/api/analyze")
+async def analyze_pdf(taskId: str = Form(...), filename: str = Form(...)):
+    task_id = taskId
+    safe_filename = sanitize_filename(filename)
+    temp_file_path = os.path.join(tempfile.gettempdir(), f"{task_id}_{safe_filename}")
+    if not os.path.exists(temp_file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    # If result already exists, do not re-run analysis
+    if task_id in result_store:
+        backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
+        return {
+            "taskId": task_id,
+            "pdfUrl": f"{backend_url}/api/images/{task_id}_{safe_filename}",
+            "analysis": result_store[task_id]["analysis"]
+        }
     try:
-        # Read file content
-        content = await file.read()
-        safe_filename = sanitize_filename(file.filename)
-        logger.info(f"Processing PDF file: {safe_filename}, size: {len(content)} bytes")
-        
-        # Save the uploaded file
-        temp_file_path = os.path.join(tempfile.gettempdir(), safe_filename)
-        with open(temp_file_path, "wb") as f:
-            f.write(content)
-        
-        # Convert PDF to images
+        with open(temp_file_path, "rb") as f:
+            content = f.read()
         pdf_converter = PDFConverter()
         try:
             logger.info("Starting PDF to image conversion")
+            update_progress(task_id, "processing", 0, 100, "Starting PDF conversion...")
             pages_info = pdf_converter.pdf_to_images(content)
             logger.info(f"PDF conversion complete. Generated {len(pages_info)} pages")
-            
-            # Prepare images for analysis
+            for i, page in enumerate(pages_info):
+                progress_percent = int((i + 1) / len(pages_info) * 100)
+                update_progress(task_id, "processing", progress_percent, 100, f"Processed page {i + 1} of {len(pages_info)}")
+                await asyncio.sleep(0.1)
+            update_progress(task_id, "analyzing", 0, 100, "Preparing images for analysis...")
             images = []
-            for page in pages_info:
+            for i, page in enumerate(pages_info):
                 try:
                     with Image.open(page['image_path']) as pil_image:
-                        # Optimize image size
                         if pil_image.size[0] > 768 or pil_image.size[1] > 768:
                             pil_image.thumbnail((768, 768), Image.Resampling.LANCZOS)
-                        
-                        # Convert to AutoGen Image
                         autogen_image = AutoGenImage(pil_image)
                         images.append(autogen_image)
+                        progress_percent = int((i + 1) / len(pages_info) * 50)
+                        update_progress(task_id, "analyzing", progress_percent, 100, f"Prepared image {i + 1} of {len(pages_info)}")
                 except Exception as e:
                     logger.error("Error processing image page")
                     continue
-
             if not images:
                 raise HTTPException(status_code=500, detail="Failed to process PDF images")
-
-            # Prepare the prompt
-            prompt = f"""Analyze the following construction plan images for plumbing systems:
-
-Document Information:
-- File Name: {safe_filename}
-- Total Pages: {len(pages_info)}
-
-Please analyze this construction plan focusing specifically on plumbing systems."""
-
-            # Create multimodal message
+            prompt = f"""Analyze the following construction plan images for plumbing systems:\n\nDocument Information:\n- File Name: {safe_filename}\n- Total Pages: {len(pages_info)}\n\nPlease analyze this construction plan focusing specifically on plumbing systems."""
             multimodal_message = MultiModalMessage(
                 content=[prompt] + images,
                 source="user"
             )
-
-            # Get analysis from AutoGen agent
+            update_progress(task_id, "analyzing", 50, 100, "Sending to AI for analysis...")
             from autogen_core import CancellationToken
             try:
                 logger.info("Sending request to Azure OpenAI")
                 response = await plumbing_agent.on_messages([multimodal_message], CancellationToken())
                 analysis_content = response.chat_message.content if hasattr(response, 'chat_message') else str(response)
                 logger.info("Successfully received response from Azure OpenAI")
+                update_progress(task_id, "complete", 100, 100, "Analysis complete!")
+                backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
+                # Store result
+                result_store[task_id] = {
+                    "pdfUrl": f"{backend_url}/api/images/{task_id}_{safe_filename}",
+                    "analysis": analysis_content
+                }
             except Exception as e:
                 logger.error(f"Error during AI analysis: {str(e)}")
                 raise HTTPException(status_code=500, detail="AI analysis failed")
-
-            # Clean up temporary files
             pdf_converter.cleanup()
-
             backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
             return {
-                "pdfUrl": f"{backend_url}/api/images/{safe_filename}",
-                "analysis": analysis_content
+                "taskId": task_id,
+                "pdfUrl": f"{backend_url}/api/images/{task_id}_{safe_filename}",
+                "analysis": result_store[task_id]["analysis"]
             }
-
         except Exception as e:
             logger.error(f"Error during PDF conversion: {str(e)}")
             pdf_converter.cleanup()
             raise HTTPException(status_code=500, detail="Error processing document")
-
     except Exception as e:
         logger.error(f"Error processing PDF: {str(e)}")
         raise HTTPException(status_code=500, detail="Error processing document")
+
+@app.get("/api/progress/{task_id}")
+async def get_progress(task_id: str):
+    """Get progress updates for a specific task"""
+    if task_id not in progress_store:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    return progress_store[task_id]
+
+@app.get("/api/progress/{task_id}/stream")
+async def stream_progress(task_id: str):
+    """Stream progress updates for a specific task using Server-Sent Events"""
+    
+    async def event_generator():
+        last_update = None
+        
+        while True:
+            if task_id in progress_store:
+                current_update = progress_store[task_id]
+                
+                # Only send if there's a new update
+                if last_update != current_update:
+                    last_update = current_update
+                    yield f"data: {json.dumps(current_update)}\n\n"
+                
+                # If analysis is complete, stop streaming
+                if current_update["stage"] == "complete":
+                    break
+            
+            await asyncio.sleep(0.5)  # Check every 500ms
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Content-Type": "text/event-stream",
+        }
+    )
 
 @app.get("/api/images/{filename}")
 async def get_image(filename: str):
@@ -207,6 +272,12 @@ async def get_image(filename: str):
     except Exception as e:
         logger.error(f"Error serving file: {str(e)}")
         raise HTTPException(status_code=500, detail="Error serving file")
+
+@app.get("/api/result/{task_id}")
+async def get_result(task_id: str):
+    if task_id not in result_store:
+        raise HTTPException(status_code=404, detail="Result not found")
+    return result_store[task_id]
 
 if __name__ == "__main__":
     import uvicorn

@@ -105,7 +105,7 @@ export default function PlumbingAnalysis({ analysis }: PlumbingAnalysisProps) {
   const sections = parseAnalysis(analysis);
 
   return (
-    <div className="w-[65%] p-6 bg-gray-800 rounded-xl shadow-lg border border-gray-700">
+    <div className="w-[60%] p-6 bg-gray-800 rounded-xl shadow-lg border border-gray-700">
       <h2 className="text-2xl font-semibold text-white mb-4">Analysis Results</h2>
       <div className="space-y-4">
         {sections.map((section, index) => (
