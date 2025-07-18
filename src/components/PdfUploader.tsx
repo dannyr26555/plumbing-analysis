@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from 'react';
 
 interface PdfUploaderProps {
-  onUploadSuccess: (url: string, analysis: string) => void;
+  onUploadSuccess: (url: string, analysis: any, context: string | null) => void;
 }
 
 interface ProgressState {
@@ -93,12 +93,16 @@ export default function PdfUploader({ onUploadSuccess }: PdfUploaderProps) {
     }
     // Step 2: Start progress stream
     startProgressStream(taskId, async () => {
-      // Step 4: When complete, fetch result from /api/result/{taskId}
+      // Step 4: When complete, fetch result from backend
       try {
         const resultRes = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/api/result/${taskId}`);
+        
         if (!resultRes.ok) throw new Error('Failed to fetch analysis result');
         const resultData = await resultRes.json();
-        onUploadSuccess(resultData.pdfUrl, resultData.analysis);
+        
+        // The new backend returns structured data in resultData.analysis
+        // We pass the structured analysis data and any context is embedded within it
+        onUploadSuccess(resultData.pdfUrl, resultData.analysis, null);
       } catch (err) {
         setError(err instanceof Error ? err.message : 'An error occurred during analysis');
       } finally {

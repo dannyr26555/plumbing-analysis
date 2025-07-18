@@ -105,3 +105,6 @@ azure-deploy-*.log
 # Project specific
 plumbing-analysis/backend/temp/
 plumbing-analysis/backend/logs/
+
+# Specific files to ignore
+backend/2025-03-06 Relaimed Water Plans.pdf
