@@ -2,6 +2,11 @@
 PDF Processing Module
 Converts PDF documents into individual PNG images for each page using PyMuPDF
 Extracts text layers, sheet metadata, and generates high-quality images
+
+Environment Variables:
+- PDF_RENDER_DPI: Override default DPI for PDF rendering (default: 400 - conservative balance)
+- PDF_MAX_DPI: Maximum allowed DPI to prevent memory issues (default: 900 - conservative limit)
+- PDF_ENABLE_SHARPENING: Enable/disable image sharpening (default: true)
 """
 
 from PIL import Image
@@ -17,32 +22,55 @@ from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 class PDFConverter:
     """Handles PDF document processing and page extraction using PyMuPDF"""
     
-    def __init__(self):
-        """Initialize PDF converter"""
+    def __init__(self, enable_sharpening: bool = None, max_dpi: int = None):
+        """
+        Initialize PDF converter with conservative quality options
+        
+        Args:
+            enable_sharpening: Whether to apply sharpening filter for symbol clarity 
+                              (default: from env var PDF_ENABLE_SHARPENING or True)
+            max_dpi: Maximum DPI to prevent excessive memory usage
+                    (default: from env var PDF_MAX_DPI or 900 - conservative setting)
+        """
         # Create a unique directory for this session
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.temp_dir = os.path.join(tempfile.gettempdir(), f"plumbing_analysis_{timestamp}")
         os.makedirs(self.temp_dir, exist_ok=True)
-        logger.info(f"Created temporary directory: {self.temp_dir}")
+        
+        # Conservative quality settings with environment variable defaults
+        if enable_sharpening is None:
+            enable_sharpening = os.getenv('PDF_ENABLE_SHARPENING', 'true').lower() in ('true', '1', 'yes', 'on')
+        if max_dpi is None:
+            max_dpi = int(os.getenv('PDF_MAX_DPI', 900))  # Conservative default
+            
+        self.enable_sharpening = enable_sharpening
+        self.max_dpi = max_dpi
+        
+        logger.info("Created temporary directory for PDF processing")
+        logger.info(f"Conservative quality settings: sharpening={enable_sharpening}, max_dpi={max_dpi}")
+        logger.info("PDF processing configured with environment overrides")
     
-    def pdf_to_images(self, pdf_content: bytes, dpi: int = 300) -> List[Dict]:
+    def pdf_to_images(self, pdf_content: bytes, dpi: int = None) -> List[Dict]:
         """
         Convert PDF pages to PNG images and extract text/metadata using PyMuPDF
         
         Args:
             pdf_content: PDF file content as bytes
-            dpi: Resolution for image conversion (default: 300 for better quality)
+            dpi: Resolution for image conversion (default: from env var PDF_RENDER_DPI or 400 - conservative balance)
             
         Returns:
             List of dictionaries containing page information, image paths, text, and metadata
         """
-        logger.info(f"Processing PDF content with {dpi} DPI")
+        # Use environment variable for default DPI if not specified
+        if dpi is None:
+            dpi = int(os.getenv('PDF_RENDER_DPI', 400))  # Conservative default
+        
+        logger.info(f"Processing PDF content with {dpi} DPI (conservative high-resolution mode for construction plans)")
         logger.info(f"PDF content size: {len(pdf_content)} bytes")
         
         try:
@@ -140,30 +168,78 @@ class PDFConverter:
         }
     
     def _generate_high_quality_image(self, page, page_num: int, dpi: int) -> Dict:
-        """Generate high-quality PNG image from PDF page"""
-        # Calculate zoom factor based on DPI
-        zoom = dpi / 72  # PyMuPDF uses 72 DPI as base
+        """Generate maximum quality PNG image from PDF page with enhanced settings"""
+        # Clamp DPI to maximum to prevent excessive memory usage
+        actual_dpi = min(dpi, self.max_dpi)
+        if actual_dpi != dpi:
+            logger.warning(f"DPI clamped from {dpi} to {actual_dpi} to prevent excessive memory usage")
+        
+        # Calculate zoom factor based on DPI (higher zoom for better clarity)
+        zoom = actual_dpi / 72  # PyMuPDF uses 72 DPI as base
         matrix = fitz.Matrix(zoom, zoom)
         
-        # Get page pixmap with high quality
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        # Get page pixmap with maximum quality settings
+        # alpha=False for RGB (no transparency overhead)
+        # colorspace=fitz.csRGB for accurate color representation
+        pix = page.get_pixmap(
+            matrix=matrix, 
+            alpha=False,
+            colorspace=fitz.csRGB
+        )
         
-        # Convert to PIL Image
+        # Convert to PIL Image with explicit RGB mode
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         
-        # Save as lossless PNG
+        # Apply optional sharpening to enhance symbol clarity
+        if self.enable_sharpening:
+            try:
+                from PIL import ImageFilter
+                # UnsharpMask with conservative settings to enhance fine details
+                # without creating artifacts in construction drawings
+                img = img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=110, threshold=2))
+                logger.debug(f"Applied sharpening filter to page {page_num}")
+            except ImportError:
+                logger.warning("PIL ImageFilter not available, skipping sharpening")
+            except Exception as e:
+                logger.warning(f"Failed to apply sharpening filter: {e}")
+        
+        # Generate output filename
         image_filename = f"page_{page_num:03d}.png"
         image_path = os.path.join(self.temp_dir, image_filename)
         
-        # Save with maximum quality
-        img.save(image_path, "PNG", optimize=False, compress_level=0)
+        # Save with maximum quality PNG settings (completely lossless)
+        # compress_level=1 provides good file size with no quality loss
+        # optimize=False to avoid any potential quality degradation
+        # format="PNG" explicitly specifies lossless PNG format
+        try:
+            img.save(
+                image_path, 
+                format="PNG",
+                compress_level=1,  # Light compression for smaller files, no quality loss
+                optimize=False,    # Disable optimization to prevent any quality changes
+                pnginfo=None       # No metadata to keep files clean
+            )
+        except Exception as e:
+            # Fallback to basic PNG save if advanced options fail
+            logger.warning(f"Advanced PNG save failed, using basic mode: {e}")
+            img.save(image_path, format="PNG")
         
-        logger.info(f"Generated high-quality image: {image_path} ({img.width}x{img.height})")
+        # Clean up PyMuPDF pixmap to free memory
+        pix = None
+        
+        # Calculate actual file size for logging
+        file_size_mb = os.path.getsize(image_path) / (1024 * 1024)
+        
+        logger.info("Generated maximum quality image")
+        logger.info(f"Image dimensions: {img.width}x{img.height} pixels at {actual_dpi} DPI")
+        logger.info(f"File size: {file_size_mb:.1f} MB")
         
         return {
             "image_path": image_path,
             "width": img.width,
-            "height": img.height
+            "height": img.height,
+            "dpi": actual_dpi,
+            "file_size_mb": file_size_mb
         }
     
     def _extract_sheet_metadata(self, raw_text: str, text_dict: Dict) -> Dict:
@@ -402,13 +478,16 @@ class PDFConverter:
         return legend
     
     def _extract_text_blocks(self, text_dict: Dict) -> List[Dict]:
-        """Extract structured text blocks with positioning"""
+        """Extract structured text blocks with positioning and quality metadata"""
         text_blocks = []
         
         for block in text_dict.get("blocks", []):
             if "lines" in block:
                 block_text = ""
                 bbox = block.get("bbox", [])
+                
+                # Calculate confidence based on text extraction quality
+                confidence = self._calculate_text_confidence(block)
                 
                 for line in block["lines"]:
                     line_text = ""
@@ -419,10 +498,50 @@ class PDFConverter:
                 if block_text.strip():
                     text_blocks.append({
                         "text": block_text.strip(),
-                        "bbox": bbox
+                        "bbox": bbox,
+                        "confidence": confidence,
+                        "source": "pdf_text"  # PyMuPDF direct text extraction
                     })
         
         return text_blocks
+    
+    def _calculate_text_confidence(self, block: Dict) -> float:
+        """Calculate confidence score for text block based on extraction quality"""
+        try:
+            confidence = 0.8  # Base confidence for PDF text extraction
+            
+            # Check for text clarity indicators
+            total_chars = 0
+            suspicious_chars = 0
+            
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text = span.get("text", "")
+                    total_chars += len(text)
+                    
+                    # Count suspicious characters that might indicate poor extraction
+                    suspicious_chars += sum(1 for char in text if char in '?□▯▪▫■□')
+                    
+                    # Check font size (very small text might be less reliable)
+                    font_size = span.get("size", 12)
+                    if font_size < 8:
+                        confidence -= 0.1
+                    elif font_size > 20:
+                        confidence += 0.1
+            
+            # Adjust confidence based on suspicious character ratio
+            if total_chars > 0:
+                suspicious_ratio = suspicious_chars / total_chars
+                confidence -= suspicious_ratio * 0.5
+            
+            # Ensure confidence stays within bounds
+            confidence = max(0.1, min(1.0, confidence))
+            
+            return round(confidence, 3)
+            
+        except Exception as e:
+            logger.warning(f"Error calculating text confidence: {e}")
+            return 0.5  # Default medium confidence
     
     def _extract_notes(self, raw_text: str) -> List[str]:
         """Extract notes and general instructions"""
@@ -455,4 +574,4 @@ class PDFConverter:
         """Remove all temporary files and directory"""
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
-            logger.info(f"Removed temporary directory: {self.temp_dir}") 
+            logger.info("Removed temporary directory") 

@@ -37,6 +37,14 @@ interface PlumbingResult {
   summary?: string;
 }
 
+interface ProcessingError {
+  agent: string;
+  sheet_id?: string;
+  error_type: string;
+  error_message: string;
+  timestamp: string;
+}
+
 interface AnalysisData {
   task_id: string;
   sheets_processed: string[];
@@ -47,6 +55,10 @@ interface AnalysisData {
     stage: string;
     progress: number;
     message: string;
+    errors: ProcessingError[];
+    total_errors: number;
+    agent_error_summary: { [key: string]: number };
+    sheet_error_summary: { [key: string]: number };
   };
   metadata: {
     filename: string;
@@ -455,7 +467,16 @@ export default function PlumbingAnalysis({ analysis, context }: PlumbingAnalysis
             </div>
             <div>
               <span className="text-gray-400">Status:</span>
-              <div className="text-green-400 font-medium">{analysisData.processing_status.message}</div>
+              <div className={`font-medium flex items-center gap-2 ${
+                analysisData.processing_status.total_errors > 0 ? 'text-yellow-400' : 'text-green-400'
+              }`}>
+                {analysisData.processing_status.message}
+                {analysisData.processing_status.total_errors > 0 && (
+                  <span className="text-red-400 text-sm">
+                    ({analysisData.processing_status.total_errors} error{analysisData.processing_status.total_errors !== 1 ? 's' : ''})
+                  </span>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -667,6 +688,66 @@ export default function PlumbingAnalysis({ analysis, context }: PlumbingAnalysis
             </div>
           ))}
         </div>
+
+        {/* Error Display Section - Moved to Bottom */}
+        {analysisData.processing_status.total_errors > 0 && (
+          <div className="mt-6 p-4 bg-red-900/20 border border-red-500 rounded-lg">
+            <div className="flex items-center gap-2 mb-3">
+              <span className="text-red-400 text-xl">⚠️</span>
+              <h3 className="text-lg font-medium text-red-400">
+                Analysis Errors ({analysisData.processing_status.total_errors})
+              </h3>
+            </div>
+            
+            <div className="mb-4">
+              <h4 className="text-sm font-medium text-red-300 mb-2">Error Summary:</h4>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+                <div>
+                  <span className="text-gray-400">By Agent:</span>
+                  <div className="text-red-200">
+                    {Object.entries(analysisData.processing_status.agent_error_summary).map(([agent, count]) => (
+                      <div key={agent} className="ml-2">• {agent}: {count} error{count !== 1 ? 's' : ''}</div>
+                    ))}
+                  </div>
+                </div>
+                {Object.keys(analysisData.processing_status.sheet_error_summary).length > 0 && (
+                  <div>
+                    <span className="text-gray-400">By Sheet:</span>
+                    <div className="text-red-200">
+                      {Object.entries(analysisData.processing_status.sheet_error_summary).map(([sheet, count]) => (
+                        <div key={sheet} className="ml-2">• Sheet {sheet}: {count} error{count !== 1 ? 's' : ''}</div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <h4 className="text-sm font-medium text-red-300">Detailed Errors:</h4>
+              <div className="max-h-40 overflow-y-auto space-y-2">
+                {analysisData.processing_status.errors.map((error, index) => (
+                  <div key={index} className="p-3 bg-red-900/30 border border-red-700 rounded text-sm">
+                    <div className="flex justify-between items-start mb-1">
+                      <span className="font-medium text-red-300">
+                        {error.agent} {error.sheet_id && `(Sheet ${error.sheet_id})`}
+                      </span>
+                      <span className="text-xs text-red-400">
+                        {new Date(error.timestamp).toLocaleTimeString()}
+                      </span>
+                    </div>
+                    <div className="text-red-200 mb-1">
+                      <span className="text-red-400 font-medium">Type:</span> {error.error_type}
+                    </div>
+                    <div className="text-red-100">
+                      {error.error_message}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     );
   }

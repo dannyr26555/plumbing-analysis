@@ -25,6 +25,8 @@ class TextBlock(BaseModel):
     """Text block with positioning information"""
     text: str = Field(description="Text content")
     bbox: Optional[BoundingBox] = Field(default=None, description="Bounding box coordinates")
+    confidence: Optional[float] = Field(default=None, description="Confidence score 0-1 for text extraction quality")
+    source: Optional[str] = Field(default=None, description="Source of text extraction (e.g., 'ocr', 'pdf_text')")
 
 class SheetMetadata(BaseModel):
     """Sheet metadata extracted from PDF"""
@@ -74,7 +76,7 @@ class ContextOutput(BaseModel):
     sheet_metadata: SheetMetadata = Field(description="Extracted sheet metadata")
     legend: List[LegendEntry] = Field(description="Complete legend entries")
     drawing_types: List[str] = Field(default_factory=list, description="Types of drawings identified")
-    annotation_systems: Dict[str, str] = Field(default_factory=dict, description="Annotation and numbering systems")
+    annotation_systems: Dict[str, Optional[str]] = Field(default_factory=dict, description="Annotation and numbering systems")
     technical_standards: List[str] = Field(default_factory=list, description="Referenced standards")
     document_organization: Dict[str, Any] = Field(default_factory=dict, description="Document organization info")
 

@@ -22,7 +22,7 @@ export default function Home() {
         {!pdfUrl || !analysis ? (
           <PdfUploader onUploadSuccess={handleUploadSuccess} />
         ) : (
-          <div className="flex gap-8 justify-center">
+          <div className="flex gap-8 justify-center items-start">
             <PlumbingAnalysis analysis={analysis} context={context} />
             <PdfViewer url={pdfUrl} />
           </div>

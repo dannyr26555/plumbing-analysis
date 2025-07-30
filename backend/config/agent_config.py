@@ -45,8 +45,10 @@ Example JSON structure:
     "Limited space in mechanical room"
   ],
   "summary": "Analysis complete with mixed confidence levels"
-}
+}"""
 
+# Material extraction rules - referenced by specialized agents
+MATERIAL_EXTRACTION_RULES = """
 MATERIAL EXTRACTION RULES:
 - Extract ONLY physical materials/products, NOT installation instructions
 - Remove action verbs: Install, Construct, Furnish, Provide, Supply, etc.
@@ -159,6 +161,8 @@ You must perform BOTH contextual reference AND direct visual analysis. The conte
 
 {JSON_RESPONSE_FORMAT}
 
+{MATERIAL_EXTRACTION_RULES}
+
 MULTI-SOURCE ANALYSIS PROCESS:
 
 **PHASE 1 - REFERENCE PREPARATION:**
@@ -230,12 +234,26 @@ For EACH material type identified:
 - If text is unclear or blurry, use lower confidence scores (0.3-0.5)
 - Prefer null values over guessed quantities - accuracy is more important than completeness
 
+**NOTES DOCUMENTATION FOR CONFIDENCE ENHANCEMENT:**
+In the notes field, clearly document your evidence and measurement approach using specific keywords:
+- **EXPLICIT EVIDENCE**: "measured from dimension label", "quantity callout shows X", "detail schedule specifies", "dimension label indicates"
+- **VISUAL ESTIMATES**: "counted X visible symbols", "traced route length", "estimated from plan view", "visible pipe segments"
+- **INFERRED/UNCERTAIN**: "mentioned in text", "inferred from context", "assumed based on", "unclear annotation", "blurry text"
+- **SYMBOL MATCHING**: "matches legend symbol [X]", "identified from legend as [description]", "symbol defined in legend"
+- **ANNOTATION QUALITY**: "clear dimension label", "explicit quantity callout", "well-marked", "unclear marking", "partial annotation"
+
 **QUALITY ASSURANCE:**
 - If context agent found symbols but you see more instances, count what YOU see
 - If you find materials not in the context agent's legend, include them with notes
 - Only provide quantities/units when there's clear evidence in the document
 - Use confidence scores to reflect uncertainty (0.0 = very uncertain, 1.0 = very certain)
 - When in doubt about quantity or unit, leave as null and note the limitation
+
+**SYMBOL MATCHING RULES:**
+- **PRIMARY RULE**: When counting material instances, use ONLY symbols defined in the legend from the context agent
+- **UNMATCHED SYMBOLS**: If a symbol is visible but not defined in the context agent's legend, include it with `confidence < 0.5` and add note: `"Unmatched symbol - not found in legend"`
+- **LEGEND VALIDATION**: Cross-reference every counted item against the context agent's legend entries
+- **UNKNOWN SYMBOLS**: For symbols not in the legend, provide best interpretation but clearly flag uncertainty
 
 **EXAMPLE GOOD ANALYSIS:**
 ✅ GOOD: "Gate Valve 8-inch - 7 EA" (counted 7 valve symbols along main routes)
@@ -245,52 +263,23 @@ For EACH material type identified:
 ❌ WRONG: "Dirty Water - 1 LS" (guessing quantity and unit with no document evidence)
 ❌ WRONG: "Gate Valve - 1 EA" (just from legend without counting actual instances)
 
-CRITICAL: Return ONLY valid JSON matching the schema. Perform COMPREHENSIVE analysis of ALL visual content.""",
+**BEFORE RETURNING YOUR RESULTS:**
+- Review how each quantity was determined: explicitly labeled, visually counted, or estimated
+- Adjust confidence score based on measurement method:
+  • 0.9–1.0 → clearly labeled quantity with dimension callouts or schedules
+  • 0.6–0.8 → visual symbol count with clear annotations
+  • 0.3–0.5 → layout-based estimates or unclear markings
+  • <0.3   → unclear, speculative, or inferred quantities
+- Add detailed `notes` field per item explaining uncertainty, method, and evidence source
+- Ensure compliance with MATERIAL EXTRACTION RULES (see above)
 
-    "preprocessor": f"""You are a construction document preprocessor and classifier. {CONTEXT_IMAGE_ANALYSIS_NOTICE}
-
-**CRITICAL: RESPOND WITH VALID JSON ONLY**
-
-You must respond with properly formatted JSON that matches this exact schema:
-{{
-  "sheet_type": "plumbing",
-  "complexity_score": 0.75,
-  "recommended_agents": ["context", "plumbing"],
-  "processing_notes": ["Multiple plumbing zones identified", "Complex fixture layout"]
-}}
-
-Your role is to:
-1. CLASSIFY SHEET TYPE: Determine the primary discipline (plumbing, mechanical, electrical, architectural, civil)
-2. ASSESS COMPLEXITY: Rate from 0.0 (simple) to 1.0 (very complex) based on:
-   - Number of systems shown
-   - Density of information
-   - Clarity of drawings
-   - Amount of detail and annotation
-
-3. RECOMMEND ANALYSIS AGENTS: Suggest which specialized agents should analyze this sheet
-4. PROVIDE PROCESSING NOTES: Brief observations about the sheet content and structure
-
-CLASSIFICATION CRITERIA:
-- "plumbing": Water supply, drainage, fixtures, pumps
-- "mechanical": HVAC, ventilation, equipment
-- "electrical": Power, lighting, controls
-- "architectural": Building layout, rooms, structures  
-- "civil": Site work, utilities, grading
-- "mixed": Multiple disciplines on one sheet
-
-COMPLEXITY FACTORS:
-- 0.1-0.3: Simple layouts, few components
-- 0.4-0.6: Moderate complexity, standard systems
-- 0.7-0.9: Complex systems, many components
-- 1.0: Extremely detailed, multiple overlapping systems
-
-CRITICAL: Return ONLY valid JSON. No text before or after. No markdown code blocks."""
+CRITICAL: Return ONLY valid JSON matching the schema. Perform COMPREHENSIVE analysis of ALL visual content."""
 }
 
 # Agent configuration
 AGENT_CONFIG = {
     "specialized_tabs": ["plumbing"],
-    "analysis_workflow": ["preprocessor", "context", "plumbing"],  # Three-stage analysis workflow
+    "analysis_workflow": ["context", "plumbing"],  # Two-stage analysis workflow
     "enable_agent_collaboration": True,
     "structured_output": True,
     "persistence_enabled": True

@@ -13,5 +13,5 @@ pymysql
 passlib[bcrypt]
 email-validator
 Pillow
-azure-ai-inference>=1.0.0
+azure-ai-inference>=1.0.0b9
 azure-identity>=1.15.0 

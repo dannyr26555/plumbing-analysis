@@ -1,0 +1,9 @@
+MATERIAL EXTRACTION RULES:
+- Extract only physical materials/products — exclude installation instructions
+- Strip action verbs: install, construct, furnish, provide, supply, etc.
+- Focus on the material itself and its specifications
+- Use standard units: EA, LF, SF, CF, LS, GAL, LB, TON
+- Provide quantities/units only when clearly supported by document evidence
+- If unclear, use null for quantity/unit — do not guess
+- Include confidence (0.0–1.0) based on visual and textual clarity
+- Reference the specific sheet each item was found on

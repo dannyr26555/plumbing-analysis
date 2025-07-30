@@ -2,7 +2,6 @@ from fastapi import FastAPI, UploadFile, HTTPException, Depends, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 import os
-from dotenv import load_dotenv
 import fitz  # PyMuPDF
 from PIL import Image
 import logging
@@ -12,24 +11,33 @@ from datetime import datetime
 from pdf_converter import PDFConverter
 from autogen_agentchat.agents import AssistantAgent
 from autogen_ext.models.openai import OpenAIChatCompletionClient
-from autogen_core import Image as AutoGenImage
+from autogen_core import Image as AutoGenImage, CancellationToken
 from autogen_agentchat.messages import MultiModalMessage
 import json
 from pathlib import Path
-from config.agent_config import SYSTEM_MESSAGES, AGENT_CONFIG, JSON_RESPONSE_FORMAT
 import asyncio
 import uuid
 import base64
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from pydantic import ValidationError
+import re
+import difflib
+
+# Import refactored components
+from config.app_config import AppConfig
+from config.prompt_manager import PromptManager
+from utils.agent_factory import AgentFactory
+from utils.response_parser import AgentResponseParser
+from utils.image_processor import ImageProcessor
+
+# Import legacy config for backward compatibility (will be removed)
+from config.agent_config import SYSTEM_MESSAGES, AGENT_CONFIG, JSON_RESPONSE_FORMAT
+
 from models import (
     AgentInput, MaterialItem, ContextOutput, PlumbingOutput, 
-    PreprocessorOutput, AnalysisResult, ProcessingStatus, 
+    AnalysisResult, ProcessingStatus, 
     LegendEntry, TextBlock, SheetMetadata, BoundingBox, ProcessingError
 )
-import re
-from typing import Dict, List, Any, Optional, Tuple
-import difflib
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -40,117 +48,99 @@ progress_store = {}
 # Store for analysis results
 result_store = {}
 
-# Load environment variables from project root
+# Initialize centralized configuration
 try:
-    env_path = Path(__file__).parent.parent / '.env'
-    if not env_path.exists():
-        raise RuntimeError("Environment configuration not found")
-    load_dotenv(env_path)
-    logger.info("Environment configuration loaded successfully")
+    AppConfig.initialize()
+    AppConfig.validate_required()
+    logger.info(f"Configuration loaded: {AppConfig.get_config_summary()}")
 except Exception as e:
-    logger.error("Failed to load environment configuration")
-    raise RuntimeError("Environment configuration error")
+    logger.error(f"Failed to initialize application configuration: {str(e)}")
+    raise RuntimeError("Application configuration initialization failed")
 
 # Initialize FastAPI app
 app = FastAPI()
 
-# CORS middleware
+# CORS middleware - restrict to necessary methods and headers only
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("FRONTEND_URL", "http://localhost:3000")],
+    allow_origins=[AppConfig.FRONTEND_URL],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"]
 )
 
-# Initialize AutoGen client
+# Initialize agents with factory pattern
 try:
-    # Get Azure configuration
-    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
-    if not azure_endpoint:
-        raise ValueError("AZURE_OPENAI_ENDPOINT is not set")
+    # Initialize prompt manager and load system messages
+    prompt_manager = PromptManager()
+    system_messages = prompt_manager.get_system_messages()
     
-    # Ensure endpoint has proper format
-    if not azure_endpoint.startswith('https://'):
-        azure_endpoint = f'https://{azure_endpoint}'
-    if not azure_endpoint.endswith('/'):
-        azure_endpoint += '/'
+    # Initialize agent factory
+    agent_factory = AgentFactory()
     
-    # Get deployment name
-    deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "")
-    if not deployment_name:
-        raise ValueError("AZURE_OPENAI_DEPLOYMENT_NAME is not set")
+    # Create all agents at once
+    agents = agent_factory.create_standard_agents(system_messages)
     
-    # Construct the full endpoint URL
-    full_endpoint = f"{azure_endpoint}openai/deployments/{deployment_name}"
+    # Extract agents for backward compatibility
+    context_agent = agents["context"]
+    plumbing_agent = agents["plumbing"]
     
-    # Log configuration (without sensitive data)
-    logger.info("Azure OpenAI Configuration:")
-    logger.info(f"API Base: {full_endpoint}")
-    logger.info(f"API Version: {os.getenv('AZURE_OPENAI_API_VERSION')}")
-    logger.info(f"Deployment Name: {deployment_name}")
+    logger.info(f"Successfully initialized all agents: {list(agents.keys())}")
+    logger.info(f"Agent factory summary: {agent_factory.get_agent_summary()}")
     
-    # Create the client with explicit Azure configuration
-    client = OpenAIChatCompletionClient(
-        model=deployment_name,
-        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-        api_base=full_endpoint,
-        api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-        api_type="azure",
-        deployment_id=deployment_name,
-        base_url=full_endpoint,
-        default_headers={
-            "api-key": os.getenv("AZURE_OPENAI_API_KEY"),
-            "Content-Type": "application/json"
-        },
-        default_query={
-            "api-version": os.getenv("AZURE_OPENAI_API_VERSION")
-        }
-    )
-    logger.info("Successfully initialized Azure OpenAI client")
 except Exception as e:
-    logger.error(f"Failed to initialize Azure OpenAI client: {str(e)}")
-    raise RuntimeError("Azure OpenAI configuration error")
+    logger.error(f"Failed to initialize agents: {str(e)}")
+    raise RuntimeError(f"Agent initialization error: {str(e)}")
 
-# Initialize preprocessor agent
+# Initialize image processor
 try:
-    preprocessor_agent = AssistantAgent(
-        "preprocessor_agent",
-        client,
-        system_message=SYSTEM_MESSAGES["preprocessor"]
-    )
-    logger.info("Successfully initialized preprocessor agent")
+    image_processor = ImageProcessor()
+    logger.info(f"Image processor initialized: max_size={image_processor.max_image_size}, sharpening={image_processor.enable_sharpening}")
 except Exception as e:
-    logger.error(f"Failed to initialize preprocessor agent: {str(e)}")
-    raise RuntimeError("Preprocessor agent initialization error")
-
-# Initialize context extraction agent
-try:
-    context_agent = AssistantAgent(
-        "context_agent",
-        client,
-        system_message=SYSTEM_MESSAGES["context"]
-    )
-    logger.info("Successfully initialized context extraction agent")
-except Exception as e:
-    logger.error(f"Failed to initialize context extraction agent: {str(e)}")
-    raise RuntimeError("Context agent initialization error")
-
-# Initialize plumbing analysis agent
-try:
-    plumbing_agent = AssistantAgent(
-        "plumbing_agent",
-        client,
-        system_message=SYSTEM_MESSAGES["plumbing"]
-    )
-    logger.info("Successfully initialized plumbing analysis agent")
-except Exception as e:
-    logger.error(f"Failed to initialize plumbing analysis agent: {str(e)}")
-    raise RuntimeError("Plumbing agent initialization error")
+    logger.error(f"Failed to initialize image processor: {str(e)}")
+    raise RuntimeError(f"Image processor initialization error: {str(e)}")
 
 def sanitize_filename(filename: str) -> str:
-    """Sanitize filename to prevent path traversal and remove sensitive information."""
-    return os.path.basename(filename)
+    """Sanitize filename to prevent path traversal, injection, and remove sensitive information."""
+    import re
+    
+    # Get basename to prevent path traversal
+    safe_name = os.path.basename(filename)
+    
+    # Remove any potentially dangerous characters
+    # Keep only alphanumeric, dots, dashes, underscores
+    safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', safe_name)
+    
+    # Prevent hidden files and ensure it ends with .pdf
+    if safe_name.startswith('.'):
+        safe_name = 'file_' + safe_name[1:]
+    
+    # Ensure it ends with .pdf and isn't too long
+    if not safe_name.lower().endswith('.pdf'):
+        safe_name += '.pdf'
+    
+    # Limit length to prevent issues
+    if len(safe_name) > 100:
+        safe_name = safe_name[:96] + '.pdf'
+    
+    return safe_name
+
+def sanitize_prompt_text(text: str) -> str:
+    """Sanitize text before including in prompts to prevent injection."""
+    if not text:
+        return "Unknown"
+    
+    # Remove potential prompt injection patterns
+    sanitized = text.replace('\n', ' ').replace('\r', ' ')
+    sanitized = sanitized.replace('"""', '').replace("'''", '')
+    sanitized = sanitized.replace('SYSTEM:', '').replace('USER:', '').replace('ASSISTANT:', '')
+    sanitized = sanitized.strip()
+    
+    # Limit length and ensure safe content
+    if len(sanitized) > 50:
+        sanitized = sanitized[:47] + "..."
+    
+    return sanitized if sanitized else "Unknown"
 
 def update_progress(task_id: str, stage: str, current: int, total: int, message: str):
     """Update progress for a specific task"""
@@ -165,19 +155,9 @@ def update_progress(task_id: str, stage: str, current: int, total: int, message:
 def parse_json_response(response_text: str, expected_model=None, agent_name: str = "unknown", sheet_id: str = None, processing_errors: List[ProcessingError] = None) -> Dict[str, Any]:
     """Parse JSON response from agent and validate against model if provided"""
     try:
-        # Clean up the response text
-        cleaned_text = response_text.strip()
-        
-        # Remove any markdown code blocks if present
-        if cleaned_text.startswith("```json"):
-            cleaned_text = cleaned_text[7:]
-        if cleaned_text.startswith("```"):
-            cleaned_text = cleaned_text[3:]
-        if cleaned_text.endswith("```"):
-            cleaned_text = cleaned_text[:-3]
-        
-        # Parse JSON
-        parsed_data = json.loads(cleaned_text)
+        # Use the new AgentResponseParser for basic JSON cleaning and parsing
+        cleaned_text = AgentResponseParser.clean_json_response(response_text)
+        parsed_data = AgentResponseParser.parse_json_safely(cleaned_text)
         
         # Convert bbox lists to BoundingBox objects for validation
         def convert_bbox_in_data(data):
@@ -259,6 +239,10 @@ def parse_json_response(response_text: str, expected_model=None, agent_name: str
         # Apply material data cleaning
         clean_material_data(parsed_data)
         
+        # Normalize field names before validation if model is provided
+        if expected_model:
+            parsed_data = AgentResponseParser.normalize_field_names(parsed_data, expected_model)
+        
         # Validate against model if provided
         if expected_model:
             validated_data = expected_model(**parsed_data)
@@ -269,7 +253,7 @@ def parse_json_response(response_text: str, expected_model=None, agent_name: str
     except json.JSONDecodeError as e:
         error_msg = f"JSON parsing error: {str(e)}"
         logger.error(error_msg)
-        logger.error(f"Raw response: {response_text}")
+        logger.error("Raw response content could not be parsed as valid JSON")
         
         # Add to structured error tracking if provided
         if processing_errors is not None:
@@ -279,7 +263,7 @@ def parse_json_response(response_text: str, expected_model=None, agent_name: str
     except ValidationError as e:
         error_msg = f"Model validation error: {str(e)}"
         logger.error(error_msg)
-        logger.error(f"Parsed data: {parsed_data}")
+        logger.error("Parsed data failed model validation")
         
         # Add to structured error tracking if provided
         if processing_errors is not None:
@@ -643,39 +627,427 @@ def deduplicate_materials(materials: List[Dict]) -> List[Dict]:
     
     return deduplicated
 
-def validate_material_quantities(materials: List[Dict], max_reasonable_quantity: float = 10000) -> List[Dict]:
-    """Validate and flag potentially incorrect material quantities"""
+def validate_material_quantities(materials: List[Dict]) -> List[Dict]:
+    """
+    Validate material quantities and units for accuracy and consistency
+    
+    Args:
+        materials: List of material dictionaries from agent analysis
+        
+    Returns:
+        List of validated materials with corrected or flagged issues
+    """
     validated_materials = []
     
     for material in materials:
-        qty = material.get("quantity")
-        confidence = material.get("confidence", 1.0)
-        
-        # Create a copy to avoid modifying original
         validated_material = material.copy()
         
-        if qty and isinstance(qty, (int, float)):
-            # Flag suspiciously large quantities
-            if qty > max_reasonable_quantity:
-                validated_material["confidence"] = min(confidence, 0.3)
-                original_notes = validated_material.get("notes", "")
-                flag_note = f"Large quantity flagged for review: {qty}"
-                validated_material["notes"] = f"{original_notes}. {flag_note}" if original_notes else flag_note
-                logger.warning(f"Flagged large quantity for {material.get('item_name', 'Unknown')}: {qty}")
+        # Extract material information
+        item_name = material.get("item_name", "").lower()
+        quantity = material.get("quantity")
+        unit = material.get("unit")
+        confidence = material.get("confidence", 0.5)
+        notes = material.get("notes", "")
+        
+        validation_flags = []
+        
+        # Check for extremely high quantities without explicit documentation
+        if quantity is not None and quantity >= 1000:
+            # Look for explicit labeling evidence in notes
+            explicit_keywords = ["schedule", "dimension label", "quantity callout", "measured from", "detail specifies"]
+            has_explicit_evidence = any(keyword in notes.lower() for keyword in explicit_keywords)
             
-            # Flag quantities that seem too precise for visual estimation
-            if isinstance(qty, float) and qty > 100:
-                # Check if it's suspiciously precise (many decimal places)
-                decimal_places = len(str(qty).split('.')[-1]) if '.' in str(qty) else 0
-                if decimal_places > 1:
-                    validated_material["confidence"] = min(confidence, 0.5)
-                    original_notes = validated_material.get("notes", "")
-                    precision_note = "Precise measurement flagged - may be estimated"
-                    validated_material["notes"] = f"{original_notes}. {precision_note}" if original_notes else precision_note
+            if not has_explicit_evidence:
+                validation_flags.append("Large quantity (≥1000) without explicit documentation")
+                validated_material["confidence"] = min(confidence, 0.4)  # Cap confidence for suspicious quantities
+                logger.warning(f"Flagged large quantity without evidence: {item_name} - {quantity} {unit}")
+        
+        # Validate unit compatibility with item type
+        unit_validation_passed = True
+        if unit and quantity is not None:
+            # Define expected units for different material types
+            pipe_keywords = ["pipe", "main", "line", "conduit", "tubing"]
+            fitting_keywords = ["valve", "elbow", "tee", "coupling", "union", "adapter", "fitting", "hydrant", "meter"]
+            area_keywords = ["insulation", "coating", "lining", "membrane"]
+            volume_keywords = ["tank", "reservoir", "basin"]
+            
+            expected_linear_units = ["LF"]
+            expected_each_units = ["EA"]
+            expected_area_units = ["SF"]
+            expected_volume_units = ["CF", "GAL"]
+            
+            # Check pipe materials should use linear units
+            if any(keyword in item_name for keyword in pipe_keywords):
+                if unit not in expected_linear_units:
+                    validation_flags.append(f"Pipe material using non-linear unit: {unit}")
+                    unit_validation_passed = False
+            
+            # Check fittings/equipment should use each units
+            elif any(keyword in item_name for keyword in fitting_keywords):
+                if unit not in expected_each_units:
+                    validation_flags.append(f"Fitting/equipment using non-each unit: {unit}")
+                    unit_validation_passed = False
+            
+            # Check area materials should use area units
+            elif any(keyword in item_name for keyword in area_keywords):
+                if unit not in expected_area_units:
+                    validation_flags.append(f"Area material using non-area unit: {unit}")
+                    unit_validation_passed = False
+            
+            # Check volume materials should use volume units
+            elif any(keyword in item_name for keyword in volume_keywords):
+                if unit not in expected_volume_units:
+                    validation_flags.append(f"Volume material using non-volume unit: {unit}")
+                    unit_validation_passed = False
+        
+        # Cross-check confidence vs visibility vs type
+        confidence_issues = []
+        
+        # High confidence should have supporting evidence
+        if confidence > 0.8:
+            high_confidence_keywords = ["measured from", "dimension label", "quantity callout", "schedule", "detail"]
+            has_high_confidence_evidence = any(keyword in notes.lower() for keyword in high_confidence_keywords)
+            if not has_high_confidence_evidence:
+                confidence_issues.append("High confidence without explicit measurement evidence")
+                validated_material["confidence"] = min(confidence, 0.6)
+        
+        # Very low confidence with quantity should be questioned
+        if confidence < 0.3 and quantity is not None:
+            confidence_issues.append("Very low confidence but quantity provided")
+            
+        # Inferred materials should have lower confidence
+        if any(keyword in notes.lower() for keyword in ["inferred", "assumed", "unclear", "blurry"]):
+            if confidence > 0.5:
+                confidence_issues.append("Inferred/uncertain material with high confidence")
+                validated_material["confidence"] = min(confidence, 0.4)
+        
+        # Nullify ambiguous or unsupported values
+        nullification_reasons = []
+        
+        # Remove quantities that seem guessed rather than measured
+        if quantity is not None:
+            guessing_indicators = ["assumed", "estimated", "guessed", "approximately", "roughly"]
+            explicit_indicators = ["measured", "labeled", "callout", "schedule", "dimension"]
+            
+            has_guessing = any(indicator in notes.lower() for indicator in guessing_indicators)
+            has_explicit = any(indicator in notes.lower() for indicator in explicit_indicators)
+            
+            if has_guessing and not has_explicit and confidence < 0.4:
+                nullification_reasons.append("Quantity appears guessed rather than measured")
+                validated_material["quantity"] = None
+                validated_material["unit"] = None
+        
+        # Remove units when quantity is null
+        if validated_material.get("quantity") is None and unit is not None:
+            nullification_reasons.append("Unit removed due to null quantity")
+            validated_material["unit"] = None
+        
+        # Update notes with validation information
+        validation_notes = []
+        if validation_flags:
+            validation_notes.extend([f"Validation flag: {flag}" for flag in validation_flags])
+        if confidence_issues:
+            validation_notes.extend([f"Confidence issue: {issue}" for issue in confidence_issues])
+        if nullification_reasons:
+            validation_notes.extend([f"Nullified: {reason}" for reason in nullification_reasons])
+        
+        if validation_notes:
+            existing_notes = validated_material.get("notes", "")
+            validation_summary = "; ".join(validation_notes)
+            validated_material["notes"] = f"{existing_notes}. {validation_summary}" if existing_notes else validation_summary
+        
+        # Add validation metadata
+        validated_material["validation_metadata"] = {
+            "unit_validation_passed": unit_validation_passed,
+            "validation_flags_count": len(validation_flags),
+            "confidence_issues_count": len(confidence_issues),
+            "nullification_count": len(nullification_reasons),
+            "original_confidence": confidence
+        }
         
         validated_materials.append(validated_material)
     
+    # Log validation statistics
+    if materials:
+        flagged_count = sum(1 for m in validated_materials if m.get("validation_metadata", {}).get("validation_flags_count", 0) > 0)
+        nullified_count = sum(1 for m in validated_materials if m.get("validation_metadata", {}).get("nullification_count", 0) > 0)
+        confidence_adjusted = sum(1 for i, m in enumerate(validated_materials) if m.get("confidence", 0.5) != materials[i].get("confidence", 0.5))
+        
+        logger.info(f"Post-agent validation complete: {flagged_count}/{len(materials)} flagged, {nullified_count} nullified, {confidence_adjusted} confidence adjusted")
+    
     return validated_materials
+
+def post_agent_result_validation(materials: List[Dict], context_results: List[Dict] = None) -> List[Dict]:
+    """
+    Enhanced post-agent result validation implementing comprehensive checks
+    
+    Args:
+        materials: List of material dictionaries from agent analysis
+        context_results: Context results for cross-validation
+        
+    Returns:
+        List of validated and corrected materials
+    """
+    logger.info("Starting enhanced post-agent result validation...")
+    
+    # Apply the existing validation first
+    validated_materials = validate_material_quantities(materials)
+    
+    # Additional validation checks specific to the improvements
+    enhanced_materials = []
+    
+    for material in validated_materials:
+        enhanced_material = material.copy()
+        
+        # Get material properties
+        item_name = material.get("item_name", "").lower()
+        quantity = material.get("quantity")
+        unit = material.get("unit")
+        confidence = material.get("confidence", 0.5)
+        notes = material.get("notes", "")
+        
+        additional_flags = []
+        
+        # Recheck confidence vs visibility vs type (enhanced check)
+        visibility_confidence = 0.5  # Default
+        if "clear" in notes.lower() or "visible" in notes.lower():
+            visibility_confidence += 0.2
+        if "unclear" in notes.lower() or "blurry" in notes.lower():
+            visibility_confidence -= 0.3
+        if "counted" in notes.lower() or "measured" in notes.lower():
+            visibility_confidence += 0.3
+        
+        visibility_confidence = max(0.1, min(1.0, visibility_confidence))
+        
+        # If agent confidence is significantly higher than visibility suggests
+        if confidence > visibility_confidence + 0.3:
+            additional_flags.append("Agent confidence exceeds visibility assessment")
+            enhanced_material["confidence"] = (confidence + visibility_confidence) / 2
+        
+        # Enhanced unit matching for specialized plumbing items
+        specialized_unit_checks = {
+            "water": ["LF", "EA", "GAL"],  # Water systems can be linear, discrete, or volume
+            "sewer": ["LF", "EA"],        # Sewer systems typically linear or discrete
+            "gas": ["LF", "EA"],          # Gas lines typically linear or discrete
+            "storm": ["LF", "EA", "CF"],  # Storm systems can include volume for retention
+            "fire": ["LF", "EA", "GAL"],  # Fire systems include pipes, equipment, and water volume
+        }
+        
+        for system_type, valid_units in specialized_unit_checks.items():
+            if system_type in item_name and unit and unit not in valid_units:
+                additional_flags.append(f"Unusual unit for {system_type} system: {unit}")
+        
+        # Flag quantities that seem inconsistent with item type
+        if quantity is not None:
+            # Very small quantities for large infrastructure
+            if "main" in item_name and quantity < 10 and unit == "LF":
+                additional_flags.append("Unusually short main line")
+            
+            # Very large quantities for small items
+            if any(keyword in item_name for keyword in ["fitting", "valve", "coupling"]) and quantity > 100:
+                additional_flags.append("Unusually high quantity for individual component")
+        
+        # Update notes with additional validation
+        if additional_flags:
+            existing_notes = enhanced_material.get("notes", "")
+            additional_summary = "; ".join([f"Enhanced validation: {flag}" for flag in additional_flags])
+            enhanced_material["notes"] = f"{existing_notes}. {additional_summary}" if existing_notes else additional_summary
+        
+        # Update validation metadata
+        if "validation_metadata" not in enhanced_material:
+            enhanced_material["validation_metadata"] = {}
+        enhanced_material["validation_metadata"]["additional_flags"] = additional_flags
+        enhanced_material["validation_metadata"]["visibility_confidence"] = visibility_confidence
+        
+        enhanced_materials.append(enhanced_material)
+    
+    logger.info(f"Enhanced post-agent validation complete: {len(materials)} materials processed")
+    return enhanced_materials
+
+def compute_confidence(clarity: float, annotation_clarity: float, measurement_type: str) -> float:
+    """
+    Compute confidence score based on visual clarity, annotation quality, and measurement type
+    
+    Args:
+        clarity: Visual clarity of the material/symbol (0.0-1.0)
+        annotation_clarity: Clarity of text annotations and labels (0.0-1.0) 
+        measurement_type: Type of measurement ("explicit", "visual_estimate", "inferred")
+    
+    Returns:
+        Confidence score (0.0-1.0)
+    """
+    base = (clarity + annotation_clarity) / 2
+    
+    if measurement_type == "explicit":
+        # Explicit measurements (dimension labels, quantity callouts) get bonus
+        return min(1.0, base + 0.2)
+    elif measurement_type == "visual_estimate":
+        # Visual estimates use base score
+        return base
+    elif measurement_type == "inferred":
+        # Inferred quantities get penalty
+        return max(0.0, base - 0.3)
+    else:
+        # Default case
+        return base
+
+def analyze_material_metadata(material: Dict, context_data: Dict = None) -> Dict:
+    """
+    Analyze material metadata to determine confidence factors
+    
+    Args:
+        material: Material dictionary from agent analysis
+        context_data: Context information including legends and symbols
+        
+    Returns:
+        Dictionary with confidence metadata
+    """
+    metadata = {
+        "clarity": 0.5,  # Default medium clarity
+        "annotation_clarity": 0.5,  # Default medium annotation clarity
+        "measurement_type": "visual_estimate",  # Default type
+        "symbol_defined": False,
+        "quantity_labeled": False,
+        "has_dimensions": False,
+        "legend_match": False
+    }
+    
+    # Analyze material notes for confidence indicators
+    notes = material.get("notes", "").lower()
+    item_name = material.get("item_name", "").lower()
+    
+    # Check for explicit measurements
+    explicit_indicators = ["measured from", "dimension label", "quantity callout", "schedule", "detail", "specified"]
+    if any(indicator in notes for indicator in explicit_indicators):
+        metadata["measurement_type"] = "explicit"
+        metadata["annotation_clarity"] = 0.8
+        metadata["quantity_labeled"] = True
+    
+    # Check for visual estimates  
+    visual_indicators = ["counted", "visible", "traced route", "estimated length", "plan view"]
+    if any(indicator in notes for indicator in visual_indicators):
+        metadata["measurement_type"] = "visual_estimate"
+        metadata["clarity"] = 0.7
+    
+    # Check for inferred/uncertain quantities
+    inferred_indicators = ["mentioned", "inferred", "assumed", "unclear", "blurry", "partial"]
+    if any(indicator in notes for indicator in inferred_indicators):
+        metadata["measurement_type"] = "inferred"
+        metadata["clarity"] = 0.3
+        metadata["annotation_clarity"] = 0.3
+    
+    # Check for dimension information
+    if any(dim in item_name + notes for dim in ["inch", '"', "mm", "cm", "ft", "size"]):
+        metadata["has_dimensions"] = True
+        metadata["annotation_clarity"] = min(1.0, metadata["annotation_clarity"] + 0.2)
+    
+    # Check for legend/symbol matching
+    if context_data and "legend" in context_data:
+        legends = context_data.get("legend", [])
+        for legend_entry in legends:
+            symbol = legend_entry.get("symbol", "").lower()
+            description = legend_entry.get("description", "").lower()
+            
+            # Check if material matches a legend symbol
+            if symbol and (symbol in item_name or symbol in notes):
+                metadata["symbol_defined"] = True
+                metadata["legend_match"] = True
+                metadata["clarity"] = min(1.0, metadata["clarity"] + 0.3)
+                break
+            
+            # Check if material matches legend description
+            if description and any(word in description for word in item_name.split()):
+                metadata["legend_match"] = True
+                metadata["clarity"] = min(1.0, metadata["clarity"] + 0.2)
+    
+    # Boost confidence for materials with quantities and units
+    if material.get("quantity") is not None and material.get("unit"):
+        metadata["quantity_labeled"] = True
+        metadata["annotation_clarity"] = min(1.0, metadata["annotation_clarity"] + 0.1)
+    
+    # Adjust clarity based on precision flags
+    if "flagged for review" in notes or "precise measurement flagged" in notes:
+        metadata["clarity"] = max(0.0, metadata["clarity"] - 0.2)
+    
+    return metadata
+
+def enhance_material_confidence(materials: List[Dict], context_results: List[Dict] = None) -> List[Dict]:
+    """
+    Enhance material confidence scores using logic-based analysis
+    
+    Args:
+        materials: List of material dictionaries from agent analysis
+        context_results: List of context analysis results for legend matching
+        
+    Returns:
+        List of materials with enhanced confidence scores
+    """
+    enhanced_materials = []
+    
+    # Combine all context data for legend matching
+    combined_context = {}
+    if context_results:
+        all_legends = []
+        for context in context_results:
+            if isinstance(context, dict) and "legend" in context:
+                all_legends.extend(context.get("legend", []))
+        combined_context["legend"] = all_legends
+    
+    for material in materials:
+        enhanced_material = material.copy()
+        
+        # Analyze metadata for confidence factors
+        metadata = analyze_material_metadata(material, combined_context)
+        
+        # Compute new confidence score
+        new_confidence = compute_confidence(
+            clarity=metadata["clarity"],
+            annotation_clarity=metadata["annotation_clarity"], 
+            measurement_type=metadata["measurement_type"]
+        )
+        
+        # Store original confidence for comparison
+        original_confidence = material.get("confidence", 0.5)
+        
+        # Use the higher of original or computed confidence (don't downgrade good agent scores)
+        final_confidence = max(original_confidence, new_confidence)
+        
+        # Cap confidence for materials without quantities
+        if material.get("quantity") is None:
+            final_confidence = min(final_confidence, 0.6)
+        
+        # Update material with enhanced confidence and metadata
+        enhanced_material["confidence"] = round(final_confidence, 3)
+        enhanced_material["confidence_metadata"] = metadata
+        enhanced_material["original_confidence"] = original_confidence
+        
+        # Add confidence reasoning to notes
+        reasoning_parts = []
+        if metadata["symbol_defined"]:
+            reasoning_parts.append("symbol defined in legend")
+        if metadata["quantity_labeled"]:
+            reasoning_parts.append("quantity explicitly labeled")
+        if metadata["measurement_type"] == "explicit":
+            reasoning_parts.append("explicit measurement")
+        elif metadata["measurement_type"] == "inferred":
+            reasoning_parts.append("inferred quantity")
+        
+        if reasoning_parts:
+            confidence_note = f"Confidence: {final_confidence:.2f} ({', '.join(reasoning_parts)})"
+            original_notes = enhanced_material.get("notes", "")
+            enhanced_material["notes"] = f"{original_notes}. {confidence_note}" if original_notes else confidence_note
+        
+        enhanced_materials.append(enhanced_material)
+    
+    # Log confidence enhancement statistics
+    if materials:
+        avg_original = sum(m.get("confidence", 0.5) for m in materials) / len(materials)
+        avg_enhanced = sum(m["confidence"] for m in enhanced_materials) / len(enhanced_materials)
+        improved_count = sum(1 for m in enhanced_materials if m["confidence"] > m["original_confidence"])
+        
+        logger.info(f"Confidence enhancement: {avg_original:.3f} → {avg_enhanced:.3f} avg, {improved_count}/{len(materials)} materials improved")
+    
+    return enhanced_materials
 
 def filter_low_confidence_materials(materials: List[Dict], min_confidence: float = 0.6) -> List[Dict]:
     """Filter out materials with confidence below threshold"""
@@ -697,20 +1069,48 @@ def filter_low_confidence_materials(materials: List[Dict], min_confidence: float
 
 @app.post("/api/upload")
 async def upload_pdf(file: UploadFile):
-    if not file.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Invalid file format")
+    # Validate file format
+    if not file.filename or not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+    
+    # Read content and validate size (limit to 50MB)
+    content = await file.read()
+    max_size = 50 * 1024 * 1024  # 50MB limit
+    if len(content) > max_size:
+        raise HTTPException(status_code=413, detail="File too large. Maximum size is 50MB")
+    
+    if len(content) < 100:  # Minimum viable PDF size
+        raise HTTPException(status_code=400, detail="File appears to be corrupted or empty")
+    
+    # Basic PDF magic number validation
+    if not content.startswith(b'%PDF-'):
+        raise HTTPException(status_code=400, detail="Invalid PDF file format")
+    
     task_id = str(uuid.uuid4())
     safe_filename = sanitize_filename(file.filename)
     temp_file_path = os.path.join(tempfile.gettempdir(), f"{task_id}_{safe_filename}")
-    content = await file.read()
-    with open(temp_file_path, "wb") as f:
-        f.write(content)
-    update_progress(task_id, "uploading", 100, 100, "File upload complete")
-    return {"taskId": task_id, "filename": safe_filename}
+    
+    try:
+        with open(temp_file_path, "wb") as f:
+            f.write(content)
+        update_progress(task_id, "uploading", 100, 100, "File upload complete")
+        return {"taskId": task_id, "filename": safe_filename}
+    except Exception as e:
+        # Clean up on failure
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        raise HTTPException(status_code=500, detail="Failed to save uploaded file")
+
+def validate_task_id(task_id: str) -> str:
+    """Validate task ID format to prevent injection or traversal."""
+    import re
+    if not re.match(r'^[a-f0-9\-]{36}$', task_id):
+        raise HTTPException(status_code=400, detail="Invalid task ID format")
+    return task_id
 
 @app.post("/api/analyze")
 async def analyze_pdf(taskId: str = Form(...), filename: str = Form(...)):
-    task_id = taskId
+    task_id = validate_task_id(taskId)
     safe_filename = sanitize_filename(filename)
     temp_file_path = os.path.join(tempfile.gettempdir(), f"{task_id}_{safe_filename}")
     
@@ -719,7 +1119,7 @@ async def analyze_pdf(taskId: str = Form(...), filename: str = Form(...)):
     
     # If result already exists, do not re-run analysis
     if task_id in result_store:
-        backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
+        backend_url = AppConfig.BACKEND_URL
         return {
             "taskId": task_id,
             "pdfUrl": f"{backend_url}/api/images/{task_id}_{safe_filename}",
@@ -746,8 +1146,8 @@ async def analyze_pdf(taskId: str = Form(...), filename: str = Form(...)):
             sheets_processed = []
             processing_errors = []  # Track structured errors
             
-            # Process each page with three-stage workflow
-            total_stages = len(pages_info) * 3  # preprocessor, context, plumbing
+            # Process each page with two-stage workflow
+            total_stages = len(pages_info) * 2  # context, plumbing
             current_stage = 0
             
             for i, page_info in enumerate(pages_info):
@@ -766,57 +1166,24 @@ async def analyze_pdf(taskId: str = Form(...), filename: str = Form(...)):
                 
                 logger.info(f"Processing sheet {sheet_id} ({i+1}/{len(pages_info)})")
                 
-                # Prepare image
+                # Prepare image using ImageProcessor
                 try:
-                    with Image.open(page_info['image_path']) as pil_image:
-                        if pil_image.size[0] > 1536 or pil_image.size[1] > 1536:
-                            pil_image.thumbnail((1536, 1536), Image.Resampling.LANCZOS)
-                        autogen_image = AutoGenImage(pil_image)
+                    autogen_image = image_processor.process_image_for_agent(page_info['image_path'])
                 except Exception as e:
                     logger.error(f"Error processing image for {sheet_id}: {str(e)}")
                     add_error_to_status(processing_errors, "image_processor", sheet_id, "processing", f"Image processing failed: {str(e)}")
                     continue
                 
-                # Stage 1: Preprocessor Analysis
-                current_stage += 1
-                progress_percent = int((current_stage / total_stages) * 100)
-                update_progress(task_id, "analyzing", progress_percent, 100, f"Classifying sheet {sheet_id}...")
-                
-                preprocessor_prompt = f"""Classify and analyze this construction document:\n\nSheet: {sheet_id}\nFile: {safe_filename}\n\nAnalyze this sheet to determine its type, complexity, and recommended processing approach."""
-                
-                preprocessor_message = MultiModalMessage(
-                    content=[preprocessor_prompt, autogen_image],
-                    source="user"
-                )
-                
-                try:
-                    from autogen_core import CancellationToken
-                    preprocessor_response = await preprocessor_agent.on_messages([preprocessor_message], CancellationToken())
-                    preprocessor_content = preprocessor_response.chat_message.content if hasattr(preprocessor_response, 'chat_message') else str(preprocessor_response)
-                    
-                    # Parse preprocessor response
-                    preprocessor_data = parse_json_response(preprocessor_content, PreprocessorOutput, "preprocessor", sheet_id, processing_errors)
-                    save_intermediate_result(task_id, sheet_id, "preprocessor", preprocessor_data)
-                    
-                    logger.info(f"Preprocessor classified {sheet_id} as: {preprocessor_data['sheet_type']}")
-                    
-                except Exception as e:
-                    logger.error(f"Preprocessor analysis failed for {sheet_id}: {str(e)}")
-                    add_error_to_status(processing_errors, "preprocessor", sheet_id, "analysis", f"Preprocessor analysis failed: {str(e)}")
-                    preprocessor_data = {
-                        "sheet_type": "unknown",
-                        "complexity_score": 0.5,
-                        "recommended_agents": ["context", "plumbing"],
-                        "processing_notes": [f"Preprocessor failed: {str(e)}"]
-                    }
-                
-                # Stage 2: Context Extraction
+                # Stage 1: Context Extraction
                 current_stage += 1
                 progress_percent = int((current_stage / total_stages) * 100)
                 update_progress(task_id, "analyzing", progress_percent, 100, f"Extracting context for {sheet_id}...")
                 
                 agent_input = create_agent_input(page_info)
-                context_prompt = f"""Extract document context from this construction plan:\n\nSheet: {sheet_id}\nDiscipline: {preprocessor_data['sheet_type']}\nComplexity: {preprocessor_data['complexity_score']}\n\nStructured Input Data:\n{json.dumps(agent_input.model_dump(), indent=2)}\n\nAnalyze this construction document to extract legends, symbols, and organizational information."""
+                # Sanitize inputs before including in prompt to prevent injection
+                safe_sheet_id = sanitize_prompt_text(sheet_id)
+                safe_filename_for_prompt = sanitize_prompt_text(safe_filename)
+                context_prompt = f"""Extract document context from this construction plan:\n\nSheet: {safe_sheet_id}\nFile: {safe_filename_for_prompt}\n\nStructured Input Data:\n{json.dumps(agent_input.model_dump(), indent=2)}\n\nAnalyze this construction document to extract legends, symbols, and organizational information."""
                 
                 context_message = MultiModalMessage(
                     content=[context_prompt, autogen_image],
@@ -846,23 +1213,22 @@ async def analyze_pdf(taskId: str = Form(...), filename: str = Form(...)):
                         "document_organization": {}
                     }
                 
-                # Stage 3: Plumbing Analysis (if applicable)
+                # Stage 2: Plumbing Analysis
                 current_stage += 1
                 progress_percent = int((current_stage / total_stages) * 100)
+                update_progress(task_id, "analyzing", progress_percent, 100, f"Analyzing plumbing for {sheet_id}...")
                 
-                if preprocessor_data['sheet_type'] in ['plumbing', 'mixed', 'civil']:
-                    update_progress(task_id, "analyzing", progress_percent, 100, f"Analyzing plumbing for {sheet_id}...")
-                    
-                    # Create enhanced agent input with context
-                    plumbing_input = create_agent_input(page_info, context_data)
-                    
-                    # Build comprehensive analysis prompt
-                    discipline = preprocessor_data['sheet_type']
-                    sheet_title = page_info.get("sheet_metadata", {}).get("title", "Unknown")
-                    
-                    analysis_guidance = ""
-                    if discipline == "civil" or "water" in sheet_title.lower() or "recycled" in sheet_title.lower():
-                        analysis_guidance = """
+                # Create enhanced agent input with context
+                plumbing_input = create_agent_input(page_info, context_data)
+                
+                # Build comprehensive analysis prompt
+                sheet_title = page_info.get("sheet_metadata", {}).get("title", "Unknown")
+                
+                # Determine analysis guidance based on sheet content
+                analysis_guidance = ""
+                if ("water" in sheet_title.lower() or "recycled" in sheet_title.lower() or 
+                    "civil" in sheet_title.lower() or "utility" in sheet_title.lower()):
+                    analysis_guidance = """
 FOCUS AREAS FOR WATER/CIVIL INFRASTRUCTURE:
 - Water mains and distribution lines (measure route lengths)
 - Service connections and laterals (count each connection)
@@ -873,12 +1239,25 @@ FOCUS AREAS FOR WATER/CIVIL INFRASTRUCTURE:
 - Pipe fittings (elbows, tees, reducers, couplings)
 - Thrust blocks and anchoring systems
 - Manholes, valve boxes, and access structures"""
-                    
-                    plumbing_prompt = f"""COMPREHENSIVE PLUMBING/WATER INFRASTRUCTURE ANALYSIS
+                else:
+                    analysis_guidance = """
+FOCUS AREAS FOR PLUMBING SYSTEMS:
+- Water supply pipes and fixtures
+- Drainage and waste systems
+- Plumbing fixtures (sinks, toilets, water heaters)
+- Valves, fittings, and connections
+- Pumps and water treatment equipment
+- Pipe insulation and supports"""
+                
+                # Sanitize inputs for plumbing prompt as well
+                safe_sheet_id_plumbing = sanitize_prompt_text(sheet_id)
+                safe_sheet_title = sanitize_prompt_text(sheet_title)
+                safe_filename_plumbing = sanitize_prompt_text(safe_filename)
+                
+                plumbing_prompt = f"""COMPREHENSIVE PLUMBING/WATER INFRASTRUCTURE ANALYSIS
 
-Sheet: {sheet_id} ({sheet_title})
-Discipline: {discipline}
-Complexity: {preprocessor_data['complexity_score']}/1.0
+Sheet: {safe_sheet_id_plumbing} ({safe_sheet_title})
+File: {safe_filename_plumbing}
 
 CONTEXT DATA PROVIDED:
 {json.dumps(context_data, indent=2)}
@@ -897,60 +1276,57 @@ ANALYSIS REQUIREMENTS:
 6. **PROVIDE REALISTIC QUANTITIES**: Base quantities on visual analysis of the actual plan content
 
 CRITICAL: Perform COMPREHENSIVE visual analysis to extract ALL plumbing/water infrastructure materials visible in the drawings."""
+                
+                plumbing_message = MultiModalMessage(
+                    content=[plumbing_prompt, autogen_image],
+                    source="user"
+                )
+                
+                try:
+                    plumbing_response = await plumbing_agent.on_messages([plumbing_message], CancellationToken())
+                    plumbing_content = plumbing_response.chat_message.content if hasattr(plumbing_response, 'chat_message') else str(plumbing_response)
                     
-                    plumbing_message = MultiModalMessage(
-                        content=[plumbing_prompt, autogen_image],
-                        source="user"
-                    )
+                    # Parse plumbing response
+                    plumbing_data = parse_json_response(plumbing_content, PlumbingOutput, "plumbing", sheet_id, processing_errors)
+                    save_intermediate_result(task_id, sheet_id, "plumbing", plumbing_data)
+                    all_plumbing_results.append(plumbing_data)
                     
-                    try:
-                        plumbing_response = await plumbing_agent.on_messages([plumbing_message], CancellationToken())
-                        plumbing_content = plumbing_response.chat_message.content if hasattr(plumbing_response, 'chat_message') else str(plumbing_response)
-                        
-                        # Parse plumbing response
-                        plumbing_data = parse_json_response(plumbing_content, PlumbingOutput, "plumbing", sheet_id, processing_errors)
-                        save_intermediate_result(task_id, sheet_id, "plumbing", plumbing_data)
-                        all_plumbing_results.append(plumbing_data)
-                        
-                        # Deduplicate materials within this page first
-                        page_materials = plumbing_data.get("materials", [])
-                        if page_materials:
-                            logger.debug(f"Deduplicating materials within {sheet_id}: {len(page_materials)} materials found")
-                            deduplicated_page_materials = deduplicate_materials(page_materials)
-                            logger.debug(f"Page deduplication complete for {sheet_id}: {len(page_materials)} -> {len(deduplicated_page_materials)} unique materials")
-                        else:
-                            deduplicated_page_materials = []
-                        
-                        # Apply immediate confidence filtering to catch obvious issues early
-                        reliable_materials = [
-                            material for material in deduplicated_page_materials
-                            if material.get("confidence", 0) > 0.4  # Very low threshold here, main filtering happens later
-                        ]
-                        
-                        # Add to consolidated list with page reference
-                        for material in reliable_materials:
-                            material["reference_sheet"] = sheet_id
-                            consolidated_materials.append(material)
-                        
-                        excluded_materials = len(plumbing_data.get("materials", [])) - len(reliable_materials)
-                        if excluded_materials > 0:
-                            logger.info(f"Excluded {excluded_materials} very low-confidence materials from {sheet_id}")
-                        
-                        logger.info(f"Plumbing analysis complete for {sheet_id}")
-                        
-                    except Exception as e:
-                        logger.error(f"Plumbing analysis failed for {sheet_id}: {str(e)}")
-                        add_error_to_status(processing_errors, "plumbing", sheet_id, "analysis", f"Plumbing analysis failed: {str(e)}")
-                        plumbing_data = {
-                            "materials": [],
-                            "special_requirements": [],
-                            "potential_issues": [f"Analysis failed: {str(e)}"],
-                            "summary": "Analysis incomplete due to error"
-                        }
-                        all_plumbing_results.append(plumbing_data)
-                else:
-                    update_progress(task_id, "analyzing", progress_percent, 100, f"Skipping plumbing analysis for {sheet_id} (sheet type: {preprocessor_data['sheet_type']})")
-                    logger.info(f"Skipping plumbing analysis for {sheet_id} - sheet type: {preprocessor_data['sheet_type']} (only analyzing plumbing, mixed, and civil sheets)")
+                    # Deduplicate materials within this page first
+                    page_materials = plumbing_data.get("materials", [])
+                    if page_materials:
+                        logger.debug(f"Deduplicating materials within {sheet_id}: {len(page_materials)} materials found")
+                        deduplicated_page_materials = deduplicate_materials(page_materials)
+                        logger.debug(f"Page deduplication complete for {sheet_id}: {len(page_materials)} -> {len(deduplicated_page_materials)} unique materials")
+                    else:
+                        deduplicated_page_materials = []
+                    
+                    # Apply immediate confidence filtering to catch obvious issues early
+                    reliable_materials = [
+                        material for material in deduplicated_page_materials
+                        if material.get("confidence", 0) > 0.4  # Very low threshold here, main filtering happens later
+                    ]
+                    
+                    # Add to consolidated list with page reference
+                    for material in reliable_materials:
+                        material["reference_sheet"] = sheet_id
+                        consolidated_materials.append(material)
+                    
+                    excluded_materials = len(plumbing_data.get("materials", [])) - len(reliable_materials)
+                    if excluded_materials > 0:
+                        logger.info(f"Excluded {excluded_materials} very low-confidence materials from {sheet_id}")
+                    
+                    logger.info(f"Plumbing analysis complete for {sheet_id}")
+                    
+                except Exception as e:
+                    logger.error(f"Plumbing analysis failed for {sheet_id}: {str(e)}")
+                    add_error_to_status(processing_errors, "plumbing", sheet_id, "analysis", f"Plumbing analysis failed: {str(e)}")
+                    plumbing_data = {
+                        "materials": [],
+                        "special_requirements": [],
+                        "potential_issues": [f"Analysis failed: {str(e)}"],
+                        "summary": "Analysis incomplete due to error"
+                    }
+                    all_plumbing_results.append(plumbing_data)
             
             # Sort materials by ascending page number (materials already deduplicated per page)
             logger.info(f"Sorting materials by page number: {len(consolidated_materials)} materials found")
@@ -971,17 +1347,23 @@ CRITICAL: Perform COMPREHENSIVE visual analysis to extract ALL plumbing/water in
             sorted_materials = sorted(consolidated_materials, key=get_sort_key)
             logger.info(f"Materials sorted by ascending page number")
             
-            # Apply validation and filtering to improve accuracy
-            logger.info("Applying material validation and confidence filtering...")
-            validated_materials = validate_material_quantities(sorted_materials)
-            filtered_materials = filter_low_confidence_materials(validated_materials, min_confidence=0.6)
-            logger.info(f"Material validation complete: {len(sorted_materials)} -> {len(filtered_materials)} materials after filtering")
+            # Apply validation and enhanced confidence scoring to improve accuracy
+            logger.info("Applying material validation and enhanced confidence scoring...")
+            validated_materials = post_agent_result_validation(sorted_materials, all_context_results)
+            
+            # Apply logic-based confidence enhancement using context and annotation metadata
+            enhanced_materials = enhance_material_confidence(validated_materials, all_context_results)
+            
+            # Filter materials based on enhanced confidence scores
+            filtered_materials = filter_low_confidence_materials(enhanced_materials, min_confidence=0.6)
+            
+            logger.info(f"Material processing complete: {len(sorted_materials)} -> {len(enhanced_materials)} -> {len(filtered_materials)} materials after enhancement and filtering")
             
             # Create final analysis result with structured error tracking
             final_processing_status = create_processing_status_with_errors(
                 stage="complete",
                 progress=100.0,
-                message=f"Three-stage analysis complete! {len(processing_errors)} errors encountered." if processing_errors else "Three-stage analysis complete!",
+                message=f"Two-stage analysis complete! {len(processing_errors)} errors encountered." if processing_errors else "Two-stage analysis complete!",
                 current_sheet=None,
                 errors=processing_errors
             )
@@ -996,22 +1378,44 @@ CRITICAL: Perform COMPREHENSIVE visual analysis to extract ALL plumbing/water in
                 metadata={
                     "filename": safe_filename,
                     "total_pages": len(pages_info),
-                    "workflow": "preprocessor -> context -> plumbing",
+                    "workflow": "context -> plumbing",
                     "total_errors": len(processing_errors),
                     "agents_with_errors": list(final_processing_status.agent_error_summary.keys()) if processing_errors else [],
                     "sheets_with_errors": list(final_processing_status.sheet_error_summary.keys()) if processing_errors else [],
                     "total_materials": len(filtered_materials),
                     "materials_before_filtering": len(sorted_materials),
+                    "materials_after_validation": len(validated_materials),
+                    "materials_after_enhancement": len(enhanced_materials),
                     "confidence_threshold": 0.6,
+                    "confidence_enhancement_enabled": True,
+                    "post_agent_validation_enabled": True,
                     "deduplication_method": "per_page",
-                    "sorted_by_page": True
+                    "sorted_by_page": True,
+                    "validation_stats": {
+                        "materials_flagged": sum(1 for m in validated_materials if m.get("validation_metadata", {}).get("validation_flags_count", 0) > 0),
+                        "materials_nullified": sum(1 for m in validated_materials if m.get("validation_metadata", {}).get("nullification_count", 0) > 0),
+                        "confidence_adjustments": sum(1 for m in validated_materials if m.get("validation_metadata", {}).get("confidence_issues_count", 0) > 0),
+                        "unit_validation_failures": sum(1 for m in validated_materials if not m.get("validation_metadata", {}).get("unit_validation_passed", True)),
+                        "large_quantities_flagged": sum(1 for m in validated_materials if "Large quantity" in m.get("notes", "")),
+                        "symbol_matching_enabled": True,
+                        "enhanced_validation_rules": ["quantities_>=_1000", "unit_compatibility", "confidence_vs_visibility", "ambiguous_value_nullification"]
+                    },
+                    "confidence_stats": {
+                        "avg_original": round(sum(m.get("original_confidence", 0.5) for m in enhanced_materials) / len(enhanced_materials), 3) if enhanced_materials else 0,
+                        "avg_enhanced": round(sum(m["confidence"] for m in enhanced_materials) / len(enhanced_materials), 3) if enhanced_materials else 0,
+                        "materials_improved": sum(1 for m in enhanced_materials if m["confidence"] > m.get("original_confidence", 0.5)),
+                        "explicit_measurements": sum(1 for m in enhanced_materials if m.get("confidence_metadata", {}).get("measurement_type") == "explicit"),
+                        "visual_estimates": sum(1 for m in enhanced_materials if m.get("confidence_metadata", {}).get("measurement_type") == "visual_estimate"),
+                        "inferred_materials": sum(1 for m in enhanced_materials if m.get("confidence_metadata", {}).get("measurement_type") == "inferred"),
+                        "legend_matched": sum(1 for m in enhanced_materials if m.get("confidence_metadata", {}).get("legend_match", False))
+                    }
                 }
             )
             
-            update_progress(task_id, "complete", 100, 100, "Three-stage analysis complete!")
+            update_progress(task_id, "complete", 100, 100, "Two-stage analysis complete!")
             
             # Store results
-            backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
+            backend_url = AppConfig.BACKEND_URL
             result_store[task_id] = {
                 "pdfUrl": f"{backend_url}/api/images/{task_id}_{safe_filename}",
                 "analysis": final_result.model_dump(),
@@ -1041,7 +1445,7 @@ CRITICAL: Perform COMPREHENSIVE visual analysis to extract ALL plumbing/water in
             )
             
             # Store partial results if available
-            backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
+            backend_url = AppConfig.BACKEND_URL
             result_store[task_id] = {
                 "pdfUrl": f"{backend_url}/api/images/{task_id}_{safe_filename}",
                 "analysis": {
@@ -1101,18 +1505,44 @@ async def stream_progress(task_id: str):
 
 @app.get("/api/images/{filename}")
 async def get_image(filename: str):
-    """Serve PDF files"""
+    """Serve PDF files with security validation"""
     try:
-        file_path = os.path.join(tempfile.gettempdir(), filename)
+        # Sanitize filename to prevent path traversal
+        safe_filename = os.path.basename(filename)
+        
+        # Additional validation - ensure filename matches expected pattern
+        import re
+        if not re.match(r'^[a-f0-9\-]{36}_[a-zA-Z0-9._-]+\.pdf$', safe_filename):
+            raise HTTPException(status_code=400, detail="Invalid filename format")
+        
+        # Construct safe file path
+        file_path = os.path.join(tempfile.gettempdir(), safe_filename)
+        
+        # Verify the file path is within temp directory (additional safety)
+        real_temp_dir = os.path.realpath(tempfile.gettempdir())
+        real_file_path = os.path.realpath(file_path)
+        if not real_file_path.startswith(real_temp_dir):
+            raise HTTPException(status_code=403, detail="Access denied")
+        
         if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail="File not found")
+        
+        # Verify it's actually a PDF file
+        with open(file_path, 'rb') as f:
+            header = f.read(8)
+            if not header.startswith(b'%PDF-'):
+                raise HTTPException(status_code=400, detail="Invalid file type")
+        
         return FileResponse(file_path, media_type="application/pdf")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error serving file: {str(e)}")
         raise HTTPException(status_code=500, detail="Error serving file")
 
 @app.get("/api/result/{task_id}")
 async def get_result(task_id: str):
+    task_id = validate_task_id(task_id)
     if task_id not in result_store:
         raise HTTPException(status_code=404, detail="Result not found")
     return result_store[task_id]
@@ -1120,6 +1550,7 @@ async def get_result(task_id: str):
 @app.get("/api/context/{task_id}")
 async def get_context(task_id: str):
     """Get the context analysis for debugging purposes"""
+    task_id = validate_task_id(task_id)
     if task_id not in result_store:
         raise HTTPException(status_code=404, detail="Result not found")
     if "context_results" not in result_store[task_id]:
@@ -1129,6 +1560,7 @@ async def get_context(task_id: str):
 @app.get("/api/debug/text-extraction/{task_id}")
 async def get_text_extraction_debug(task_id: str):
     """Get raw text extraction results for debugging PDF processing issues"""
+    task_id = validate_task_id(task_id)
     import tempfile
     import json
     
@@ -1162,6 +1594,7 @@ async def get_text_extraction_debug(task_id: str):
 @app.get("/api/debug/intermediate/{task_id}")
 async def get_intermediate_results(task_id: str):
     """Get all intermediate analysis results for debugging"""
+    task_id = validate_task_id(task_id)
     import tempfile
     import json
     
@@ -1239,6 +1672,131 @@ async def get_material_validation_debug(task_id: str):
     validation_info["confidence_distribution"] = confidence_ranges
     
     return {"validation_debug": validation_info}
+
+@app.get("/api/debug/confidence-enhancement/{task_id}")
+async def get_confidence_enhancement_debug(task_id: str):
+    """Get details about confidence enhancement process and scoring logic"""
+    if task_id not in result_store:
+        raise HTTPException(status_code=404, detail="Result not found")
+    
+    analysis = result_store[task_id].get("analysis", {})
+    materials = analysis.get("consolidated_materials", [])
+    
+    enhancement_debug = {
+        "enhancement_enabled": analysis.get("metadata", {}).get("confidence_enhancement_enabled", False),
+        "confidence_stats": analysis.get("metadata", {}).get("confidence_stats", {}),
+        "material_details": []
+    }
+    
+    # Provide detailed breakdown for each material
+    for material in materials:
+        confidence_metadata = material.get("confidence_metadata", {})
+        detail = {
+            "item_name": material.get("item_name", "Unknown"),
+            "original_confidence": material.get("original_confidence", 0.5),
+            "enhanced_confidence": material.get("confidence", 0.5),
+            "confidence_change": round(material.get("confidence", 0.5) - material.get("original_confidence", 0.5), 3),
+            "measurement_type": confidence_metadata.get("measurement_type", "unknown"),
+            "clarity": confidence_metadata.get("clarity", 0.5),
+            "annotation_clarity": confidence_metadata.get("annotation_clarity", 0.5),
+            "symbol_defined": confidence_metadata.get("symbol_defined", False),
+            "quantity_labeled": confidence_metadata.get("quantity_labeled", False),
+            "has_dimensions": confidence_metadata.get("has_dimensions", False),
+            "legend_match": confidence_metadata.get("legend_match", False),
+            "quantity": material.get("quantity"),
+            "unit": material.get("unit"),
+            "notes": material.get("notes", "")
+        }
+        enhancement_debug["material_details"].append(detail)
+    
+    # Sort by confidence change (most improved first)
+    enhancement_debug["material_details"].sort(key=lambda x: x["confidence_change"], reverse=True)
+    
+    # Add summary statistics
+    if enhancement_debug["material_details"]:
+        details = enhancement_debug["material_details"]
+        enhancement_debug["summary"] = {
+            "total_materials": len(details),
+            "materials_improved": sum(1 for d in details if d["confidence_change"] > 0),
+            "materials_unchanged": sum(1 for d in details if d["confidence_change"] == 0),
+            "materials_degraded": sum(1 for d in details if d["confidence_change"] < 0),
+            "avg_confidence_change": round(sum(d["confidence_change"] for d in details) / len(details), 3),
+            "max_improvement": max(d["confidence_change"] for d in details),
+            "measurement_type_distribution": {
+                "explicit": sum(1 for d in details if d["measurement_type"] == "explicit"),
+                "visual_estimate": sum(1 for d in details if d["measurement_type"] == "visual_estimate"),
+                "inferred": sum(1 for d in details if d["measurement_type"] == "inferred")
+            }
+        }
+    
+    return {"confidence_enhancement_debug": enhancement_debug}
+
+@app.get("/api/debug/post-agent-validation/{task_id}")
+async def get_post_agent_validation_debug(task_id: str):
+    """Get details about post-agent validation process and flagged issues"""
+    if task_id not in result_store:
+        raise HTTPException(status_code=404, detail="Result not found")
+    
+    analysis = result_store[task_id].get("analysis", {})
+    materials = analysis.get("consolidated_materials", [])
+    
+    validation_debug = {
+        "validation_enabled": analysis.get("metadata", {}).get("post_agent_validation_enabled", False),
+        "validation_stats": analysis.get("metadata", {}).get("validation_stats", {}),
+        "material_details": []
+    }
+    
+    # Provide detailed breakdown for each material
+    for material in materials:
+        validation_metadata = material.get("validation_metadata", {})
+        detail = {
+            "item_name": material.get("item_name", "Unknown"),
+            "quantity": material.get("quantity"),
+            "unit": material.get("unit"),
+            "confidence": material.get("confidence", 0.5),
+            "original_confidence": validation_metadata.get("original_confidence", 0.5),
+            "unit_validation_passed": validation_metadata.get("unit_validation_passed", True),
+            "validation_flags_count": validation_metadata.get("validation_flags_count", 0),
+            "confidence_issues_count": validation_metadata.get("confidence_issues_count", 0),
+            "nullification_count": validation_metadata.get("nullification_count", 0),
+            "additional_flags": validation_metadata.get("additional_flags", []),
+            "visibility_confidence": validation_metadata.get("visibility_confidence", 0.5),
+            "notes": material.get("notes", ""),
+            "validation_impact": {
+                "was_flagged": validation_metadata.get("validation_flags_count", 0) > 0,
+                "was_nullified": validation_metadata.get("nullification_count", 0) > 0,
+                "confidence_adjusted": validation_metadata.get("confidence_issues_count", 0) > 0,
+                "unit_failed": not validation_metadata.get("unit_validation_passed", True)
+            }
+        }
+        validation_debug["material_details"].append(detail)
+    
+    # Sort by validation impact (most flagged first)
+    validation_debug["material_details"].sort(
+        key=lambda x: (x["validation_flags_count"] + x["confidence_issues_count"] + x["nullification_count"]), 
+        reverse=True
+    )
+    
+    # Add summary statistics
+    if validation_debug["material_details"]:
+        details = validation_debug["material_details"]
+        validation_debug["summary"] = {
+            "total_materials": len(details),
+            "materials_with_issues": sum(1 for d in details if d["validation_impact"]["was_flagged"] or d["validation_impact"]["was_nullified"]),
+            "materials_flagged": sum(1 for d in details if d["validation_impact"]["was_flagged"]),
+            "materials_nullified": sum(1 for d in details if d["validation_impact"]["was_nullified"]),
+            "confidence_adjusted": sum(1 for d in details if d["validation_impact"]["confidence_adjusted"]),
+            "unit_validation_failures": sum(1 for d in details if d["validation_impact"]["unit_failed"]),
+            "common_issues": {
+                "large_quantities": sum(1 for d in details if "Large quantity" in d["notes"]),
+                "unit_mismatches": sum(1 for d in details if "using non-" in d["notes"]),
+                "confidence_without_evidence": sum(1 for d in details if "without explicit" in d["notes"]),
+                "guessed_quantities": sum(1 for d in details if "appears guessed" in d["notes"]),
+                "unmatched_symbols": sum(1 for d in details if "Unmatched symbol" in d["notes"])
+            }
+        }
+    
+    return {"post_agent_validation_debug": validation_debug}
 
 @app.delete("/api/cache/clear")
 async def clear_cache():

@@ -1,0 +1,37 @@
+## SCHEMA:
+
+{
+  "sheet_metadata": {
+    "sheet_id": "P-102",
+    "discipline": "Plumbing", 
+    "floor": "Level 1",
+    "title": "Plumbing Plan",
+    "scale": "1/8\" = 1'-0\"",
+    "date": "2024-01-15"
+  },
+  "legend": [
+    {
+      "symbol": "CW",
+      "description": "Cold Water",
+      "bbox": [100, 200, 150, 220]
+    },
+    {
+      "symbol": "HW", 
+      "description": "Hot Water",
+      "bbox": [100, 230, 150, 250]
+    }
+  ],
+  "drawing_types": ["floor_plan", "details"],
+  "annotation_systems": {
+    "reference_numbers": "Bubbled numbers 1-50",
+    "detail_callouts": "Circled letters A-Z"
+  },
+  "technical_standards": ["ASTM A53", "ANSI B16.5"],
+  "document_organization": {
+    "sheet_series": "P-100 series",
+    "total_sheets": 12,
+    "revision": "Rev 2"
+  }
+}
+
+CRITICAL: Return ONLY valid JSON matching this exact schema. No text before or after. No markdown code blocks. Use "legend" (singular) not "legends" (plural). 

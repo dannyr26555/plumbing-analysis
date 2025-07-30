@@ -1,0 +1,38 @@
+## SCHEMA:
+
+{
+  "materials": [
+    {
+      "item_name": "Copper Pipe",
+      "quantity": 120,
+      "unit": "LF", 
+      "reference_sheet": "P-102",
+      "zone": "C3",
+      "size": "1 inch",
+      "specification": "Type L",
+      "confidence": 0.95,
+      "notes": "Measured from plan route"
+    },
+    {
+      "item_name": "Dirty Water System",
+      "quantity": null,
+      "unit": null,
+      "reference_sheet": "P-102",
+      "zone": null,
+      "size": null,
+      "specification": null,
+      "confidence": 0.3,
+      "notes": "Mentioned in text but no quantities visible"
+    }
+  ],
+  "special_requirements": [
+    "All copper piping shall be Type L",
+    "Install seismic restraints per code"
+  ],
+  "potential_issues": [
+    "Limited space in mechanical room"
+  ],
+  "summary": "Analysis complete with mixed confidence levels"
+}
+
+CRITICAL: Return ONLY valid JSON matching this exact schema. No text before or after. No markdown code blocks. 
